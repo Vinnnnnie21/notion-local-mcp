@@ -2,11 +2,11 @@
 
 这是一个自托管的 Linux MCP 服务，让 Notion AI 在明确授权的项目目录中读取文件，并在隔离开发副本里修改、测试和保存制品。
 
-项目拥有者和计划发布账号：`Vinnnnnie21`。仓库建议名：`notion-local-mcp`，计划发布到 `Vinnnnnie21/notion-local-mcp`，目前尚未创建远端仓库。这是第三方工具服务，不是 Notion 官方工作区 MCP，也不代表 Notion 背书。
+项目拥有者和发布账号：`Vinnnnnie21`。公开仓库地址：[Vinnnnnie21/notion-local-mcp](https://github.com/Vinnnnnie21/notion-local-mcp)。这是第三方工具服务，不是 Notion 官方工作区 MCP，也不代表 Notion 背书。
 
 ## 当前状态
 
-这是本地候选公开仓库，包含运行源码、测试、配置模板、安装辅助脚本和用户级 systemd 模板。当前候选版本来自 `2.2.1-execution-reliability`。本次没有创建 GitHub 仓库、推送远端或发布 Release。
+这是已创建的公开仓库，包含运行源码、测试、配置模板、安装辅助脚本和用户级 systemd 模板。当前版本来自 `2.2.1-execution-reliability`。目前没有发布 Release。
 
 尚未宣称所有 Linux 都支持：隔离执行需要用户级 systemd、cgroup v2、bubblewrap、namespaces，以及按需准备的 Node、Python、PostgreSQL 和 Chromium 运行时。没有这些条件时，服务必须明确失败，不会退回宿主 Shell。维护者还没有在不含生产资源的全新主机上完成本文档全部的浏览器、数据库和远程 Notion 验收，因此发布前仍需完成检查清单。
 
@@ -143,6 +143,6 @@ python3 scripts/test.py
 
 ## 安全和许可
 
-漏洞报告方式见 [SECURITY.md](SECURITY.md)。发布 GitHub 仓库后应启用 Private vulnerability reporting，并填写维护者实际可用的私密渠道。MIT 许可证只适用于本项目原创代码和文档；Python、Node、PostgreSQL、Chromium、cloudflared、MCP SDK 及其他依赖继续遵循各自许可证。项目名称不构成 Notion 商标授权。
+漏洞报告方式见 [SECURITY.md](SECURITY.md)。仓库发布后应启用 Private vulnerability reporting，并填写维护者实际可用的私密渠道。MIT 许可证只适用于本项目原创代码和文档；Python、Node、PostgreSQL、Chromium、cloudflared、MCP SDK 及其他依赖继续遵循各自许可证。项目名称不构成 Notion 商标授权。
 
 本项目不包含生产配置、token、私钥、日志、快照、状态库、离线 wheel、浏览器身份资料或个人项目代码。`.gitignore` 不能替代发布前的人工检查。

@@ -1,8 +1,8 @@
 # 任务：准备 notion 本机连接 mcp 的公开源码仓库
 
-用户计划将自建 Linux MCP 的方法和代码开源到 GitHub，名称为“notion 本机连接 mcp”，建议仓库名 notion-local-mcp，原创代码和文档采用 MIT。项目拥有者和计划发布账号为 Vinnnnnie21，计划仓库为 Vinnnnnie21/notion-local-mcp，目前尚未创建远端仓库。
+用户计划将自建 Linux MCP 的方法和代码开源到 GitHub，名称为“notion 本机连接 mcp”，建议仓库名 notion-local-mcp，原创代码和文档采用 MIT。项目拥有者和发布账号为 Vinnnnnie21，仓库为 Vinnnnnie21/notion-local-mcp。
 
-本任务只准备待公开候选仓库，不创建 GitHub 仓库、不提交远端、不改生产服务。已有文档准备包包含 README/LICENSE/SECURITY/CONTRIBUTING/.gitignore 和发布检查清单，先阅读并沿用。
+本任务负责准备公开仓库，不改生产服务。已有文档准备包包含 README/LICENSE/SECURITY/CONTRIBUTING/.gitignore 和发布检查清单，先阅读并沿用。
 
 ## 环境
 

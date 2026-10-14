@@ -11,7 +11,7 @@
 - [x] 生成真实 schema 对应的 `config.example.json` 和不会覆盖现有文件的 `scripts/init.py`。
 - [x] 提供 `scripts/check_environment.py`、`scripts/install.py`、用户级 systemd 模板和可移植单元测试 CI。
 - [x] MIT 全文采用 `Copyright (c) 2026 Vinnnnnie21`；README、SECURITY 和 CONTRIBUTING 明确第三方依赖继续使用各自许可。
-- [x] 项目拥有者和计划发布账号确认为 `Vinnnnnie21`，计划仓库为 `Vinnnnnie21/notion-local-mcp`，尚未创建远端仓库。
+- [x] 项目拥有者和发布账号确认为 `Vinnnnnie21`，公开仓库为 `Vinnnnnie21/notion-local-mcp`。
 - [x] 候选文件扫描未发现生产路径、个人邮箱、真实 IP、生产域名、token 或私有业务数据。
 
 ## 发布前阻塞项
@@ -22,9 +22,9 @@
 - [ ] 在干净主机完成认证 `tools/list`、`tools/call`、演示项目读写、隔离执行、超时、取消、输出分页、请求去重、UNKNOWN、数据库、HTTP、浏览器和清理验收。
 - [ ] 用现场输出填入版本、测试数量、跳过项和失败原因；不把私有部署测试数量当成通用保证。
 - [ ] 实际测试 HTTPS 隧道或反向代理的认证头、流式响应、证书和公网边界，不开放内部 8001。
-- [ ] 发布 GitHub 仓库后启用 Private vulnerability reporting 并填写实际私密渠道。
+- [ ] 确认 GitHub Private vulnerability reporting 已开启，并在仓库设置中复核私密报告渠道。
 - [ ] 首次发布前审阅 `git diff --cached`、Git 历史和待提交文件；秘密扫描只作为辅助。
 
 ## 交付限制
 
-本次没有创建 GitHub 仓库、提交远端、推送代码或发布 Release。当前目录只是候选公开仓库，未达到“干净环境和真实 Notion 验收全部完成”的最终发布门槛。
+仓库已创建并推送 `main` 分支，但尚未发布 Release。当前仍未达到“干净环境和真实 Notion 验收全部完成”的最终发布门槛。

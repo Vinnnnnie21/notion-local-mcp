@@ -22,7 +22,7 @@
 
 不要在公开 issue 中粘贴 Token、生产配置、个人路径、日志原文、截图凭据或可利用的生产连接地址。
 
-发布仓库后，应启用 GitHub 的 Private vulnerability reporting。若未启用，先联系维护者建立私密渠道；本资料包没有提供一个尚不存在的安全邮箱。维护者应在发布前填写渠道和受支持版本。
+请通过 GitHub 仓库的 Private vulnerability reporting 报告漏洞。不要在公开 issue 中粘贴 Token、生产配置或可利用的生产连接地址。维护者应在仓库设置中保持该渠道开启，并在发布受支持版本时同步更新安全说明。
 
 ## 发现泄漏
 
