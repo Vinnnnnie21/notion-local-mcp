@@ -1,0 +1,17 @@
+[Unit]
+Description=notion-local-mcp local MCP server
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/notion-local-mcp/app
+ExecStart=%h/.local/share/notion-local-mcp/.venv/bin/python %h/.local/share/notion-local-mcp/app/server.py --config %h/.config/notion-local-mcp/config.json --token-file %h/.config/notion-local-mcp/token --port 8001
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=default.target

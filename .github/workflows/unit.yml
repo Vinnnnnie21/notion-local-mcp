@@ -1,0 +1,22 @@
+name: portable unit tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r app/requirements.txt
+      - run: python scripts/test.py
+
+  linux-isolation:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Enable this job only on a runner with user systemd, cgroup v2, bubblewrap, and vetted runtimes.'

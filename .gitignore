@@ -1,0 +1,45 @@
+# Personal runtime configuration; keep a sanitized example in the release
+config.json
+config.local.json
+.env
+.env.*
+!.env.example
+token
+*.token
+*.pem
+*.key
+credentials/
+secrets/
+# Private runtime and release-signing state
+state/
+backups/
+artifacts/
+.dev-artifacts/
+.dev-databases/
+.dev-dependencies/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.log
+# Local development directories and dependency caches
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+coverage.xml
+.coverage
+htmlcov/
+.scratch/
+dependency-cache/
+browser-profile/
+browser-profiles/
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/

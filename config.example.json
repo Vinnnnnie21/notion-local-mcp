@@ -1,0 +1,90 @@
+{
+  "stateDir": "__CONFIG_DIR__/state",
+  "serviceNames": {
+    "mcp": "notion-local-mcp.service",
+    "tunnel": "notion-local-mcp-tunnel.service"
+  },
+  "projects": {
+    "demo": {
+      "root": "__PROJECT_ROOT__",
+      "read": true,
+      "write": true,
+      "writeAllow": ["src/*", "tests/*", "docs/*", "*.py", "*.md", "*.txt"],
+      "deny": ["*credential*", "*secret*", "*token*", "*.log"],
+      "denyDirs": ["credentials", "secrets"],
+      "gitWrite": false,
+      "pushRemotes": {},
+      "tasks": {}
+    }
+  },
+  "authorizedRoots": [
+    {"path": "__PROJECT_ROOT__", "read": true, "write": true}
+  ],
+  "administratorPaths": ["__CONFIG_DIR__"],
+  "sensitiveGrants": [],
+  "rateLimits": {
+    "readPerMinute": 600,
+    "discoveryPerMinute": 300,
+    "writePerMinute": 60,
+    "totalPerMinute": 900,
+    "concurrency": 32
+  },
+  "executionProfiles": {
+    "autonomous-development": {
+      "enabled": true,
+      "environment": "isolated-development",
+      "projects": ["demo"],
+      "readRoots": ["__PROJECT_ROOT__"],
+      "writeRoots": ["__PROJECT_ROOT__"],
+      "denyPaths": [".env", ".env.*", ".git", ".scratch", ".venv", "venv", "node_modules", "**/*.db", "**/*.sqlite*", "**/*.pem", "**/*.key", "**/credentials/*", "**/secrets/*"],
+      "network": {"mode": "loopback-only"},
+      "git": {"local": true, "push": false, "remotes": {}, "branches": ["codex/*"]},
+      "limits": {
+        "maxWorkspaces": 3,
+        "maxConcurrentTasks": 4,
+        "maxTimeoutSeconds": 600,
+        "maxWorkspaceSeconds": 3600,
+        "maxWorkspaceBytes": 268435456,
+        "maxOutputBytes": 1048576,
+        "maxMemoryBytes": 1073741824,
+        "maxProcesses": 512,
+        "cpuQuotaPercent": 100,
+        "maxRepairRounds": 5,
+        "maxWallSeconds": 3600,
+        "maxRepeatedFailures": 3
+      }
+    },
+    "readonly-runtime": {
+      "enabled": true,
+      "environment": "fixed-readonly",
+      "projects": [],
+      "readRoots": [],
+      "writeRoots": [],
+      "denyPaths": [],
+      "network": {"mode": "none"},
+      "git": {"local": false, "push": false},
+      "limits": {"maxTimeoutSeconds": 10, "maxOutputBytes": 65536},
+      "services": ["notion-local-mcp.service", "notion-local-mcp-tunnel.service"],
+      "databases": {},
+      "httpTargets": {},
+      "logs": {}
+    },
+    "mcp-self-maintenance": {
+      "enabled": true,
+      "environment": "fixed-maintenance",
+      "projects": [],
+      "readRoots": ["__CONFIG_DIR__"],
+      "writeRoots": ["__CONFIG_DIR__"],
+      "denyPaths": ["token", "state/approvals"],
+      "network": {"mode": "none"},
+      "git": {"local": false, "push": false},
+      "limits": {"maxTimeoutSeconds": 120, "maxOutputBytes": 65536},
+      "services": ["notion-local-mcp.service"],
+      "maintenance": {
+        "installationRoot": "__CONFIG_DIR__",
+        "services": ["notion-local-mcp.service"],
+        "registeredCandidates": "__CONFIG_DIR__/state/maintenance/candidates"
+      }
+    }
+  }
+}
