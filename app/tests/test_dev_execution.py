@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dev_execution import Execution, ExecutionError
 
 PROFILE = 'autonomous-development'
+RUN_INTEGRATION = os.environ.get('NOTION_MCP_RUN_INTEGRATION') == '1'
 
 
 class Backend:
@@ -37,6 +38,7 @@ class Backend:
                 if (Path(root) / name).is_symlink(): raise ValueError('link detected')
 
 
+@unittest.skipUnless(RUN_INTEGRATION, 'requires the isolated Linux runtime')
 class RealExecutionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='mcp-exec-test-')

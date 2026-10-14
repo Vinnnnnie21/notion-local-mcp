@@ -143,6 +143,6 @@ python3 scripts/test.py
 
 ## 安全和许可
 
-漏洞报告方式见 [SECURITY.md](SECURITY.md)。仓库发布后应启用 Private vulnerability reporting，并填写维护者实际可用的私密渠道。MIT 许可证只适用于本项目原创代码和文档；Python、Node、PostgreSQL、Chromium、cloudflared、MCP SDK 及其他依赖继续遵循各自许可证。项目名称不构成 Notion 商标授权。
+漏洞报告方式见 [SECURITY.md](SECURITY.md)。仓库已启用 GitHub Private vulnerability reporting。MIT 许可证只适用于本项目原创代码和文档；Python、Node、PostgreSQL、Chromium、cloudflared、MCP SDK 及其他依赖继续遵循各自许可证。项目名称不构成 Notion 商标授权。
 
 本项目不包含生产配置、token、私钥、日志、快照、状态库、离线 wheel、浏览器身份资料或个人项目代码。`.gitignore` 不能替代发布前的人工检查。

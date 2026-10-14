@@ -239,6 +239,7 @@ class Workspaces(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.backend.dev_validate_tree(self.workspaceId, self.profile)
 
+    @unittest.skipUnless(os.environ.get('NOTION_MCP_RUN_INTEGRATION') == '1', 'requires the registered offline dependency cache')
     def test_actual_cached_wheel_files_validate_without_exposure(self):
         cache = Path(os.environ.get('NOTION_MCP_PYTHON_CACHE', '/opt/dependency-cache/python'))
         wheel = next(iter(cache.glob('packaging-*.whl')), None)
@@ -256,6 +257,7 @@ class Workspaces(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.call('dev_read', path='.dev-dependencies/packaging/_parser.py')
 
+    @unittest.skipUnless(os.environ.get('NOTION_MCP_RUN_INTEGRATION') == '1', 'requires the isolated executor and offline dependency cache')
     def test_actual_offline_pip_install_in_isolated_workspace(self):
         cache = Path(os.environ.get('NOTION_MCP_PYTHON_CACHE', '/opt/dependency-cache/python'))
         if not hasattr(self.backend, 'dev_executor') or not cache.is_dir():

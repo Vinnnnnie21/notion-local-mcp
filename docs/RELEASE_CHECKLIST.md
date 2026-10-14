@@ -22,7 +22,7 @@
 - [ ] 在干净主机完成认证 `tools/list`、`tools/call`、演示项目读写、隔离执行、超时、取消、输出分页、请求去重、UNKNOWN、数据库、HTTP、浏览器和清理验收。
 - [ ] 用现场输出填入版本、测试数量、跳过项和失败原因；不把私有部署测试数量当成通用保证。
 - [ ] 实际测试 HTTPS 隧道或反向代理的认证头、流式响应、证书和公网边界，不开放内部 8001。
-- [ ] 确认 GitHub Private vulnerability reporting 已开启，并在仓库设置中复核私密报告渠道。
+- [x] 确认 GitHub Private vulnerability reporting 已开启，并在仓库设置中复核私密报告渠道。
 - [ ] 首次发布前审阅 `git diff --cached`、Git 历史和待提交文件；秘密扫描只作为辅助。
 
 ## 交付限制
