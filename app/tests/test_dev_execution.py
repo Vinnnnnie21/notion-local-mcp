@@ -60,7 +60,7 @@ class RealExecutionTests(unittest.TestCase):
     def test_real_argv_shell_node_and_python(self):
         result = self.run_command(argv=['python3', '-c', 'import os; print(os.getuid());print("ok")'])
         self.assertEqual(result['status'], 'succeeded', result)
-        self.assertIn('1000', result['stdout'])
+        self.assertIn(str(os.getuid()), result['stdout'])
         result = self.run_command(shell='printf "hello" > hello.txt; node -e "console.log(6*7)"')
         self.assertEqual(result['status'], 'succeeded', result)
         self.assertIn('42', result['stdout'])

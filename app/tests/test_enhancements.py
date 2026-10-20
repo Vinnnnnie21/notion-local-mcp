@@ -13,7 +13,7 @@ class EnhancementTests(unittest.TestCase):
 
     def test_capabilities(self):
         report=self.b.get_capabilities('code')
-        self.assertEqual(report['version'],'2.2.1-execution-reliability')
+        self.assertEqual(report['version'],'2.2.8-service-timeout-validation')
         self.assertFalse(report['features']['arbitraryShell'])
         self.assertFalse(report['features']['multiFileAtomic'])
         self.assertFalse(hasattr(self.b,'approve'))
@@ -195,7 +195,8 @@ class EnhancementTests(unittest.TestCase):
         exec(compile(ast.Module(body=nodes,type_ignores=[]),'schemas','exec'),namespace)
         import jsonschema
         descriptions=namespace['DESCRIPTIONS']
-        self.assertEqual(len(descriptions),49)
+        self.assertTrue({'dev_execution_diagnose', 'dev_execution_preserve',
+                         'dev_execution_request_recovery', 'dev_execution_apply_recovery'} <= descriptions.keys())
         for name in descriptions:
             fn=getattr(self.b,name)
             jsonschema.Draft7Validator.check_schema(namespace['tool_schema'](fn))

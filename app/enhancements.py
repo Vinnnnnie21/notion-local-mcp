@@ -255,8 +255,8 @@ def attach_backend(cls):
         env={'PATH':os.defpath,'HOME':str(Path.home()),'XDG_RUNTIME_DIR':'/run/user/'+str(os.getuid()),
              'DBUS_SESSION_BUS_ADDRESS':'unix:path=/run/user/'+str(os.getuid())+'/bus','SYSTEMD_PAGER':''}
         keys=('LoadState','ActiveState','SubState','UnitFileState','Restart','RestartUSec','StartLimitIntervalUSec','StartLimitBurst')
-        service_names = self.cfg.get('serviceNames', {})
-        for unit in (service_names.get('mcp', 'notion-local-mcp.service'), 'docker.service', service_names.get('tunnel', 'notion-local-mcp-tunnel.service')):
+        names = self.cfg.get('serviceNames', {})
+        for unit in (names.get('mcp', 'notion-local-mcp.service'), 'docker.service', names.get('tunnel', 'notion-local-mcp-tunnel.service')):
             try:
                 proc=subprocess.run(['/usr/bin/systemctl','--user','--no-pager','show',unit,*['--property='+key for key in keys]],
                     env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5)

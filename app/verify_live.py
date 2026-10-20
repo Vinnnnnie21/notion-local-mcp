@@ -2,11 +2,14 @@
 import argparse
 import base64
 import json
+import os
 import tempfile
 import urllib.request
 from pathlib import Path
 BASE=Path(os.environ.get('NOTION_MCP_HOME', Path.home()/'.config/notion-local-mcp'))
 WORK=Path(os.environ.get('NOTION_MCP_VERIFY_WORK', BASE/'verification'))
+PROJECT=os.environ.get('NOTION_MCP_VERIFY_PROJECT', 'demo')
+PROJECT_ROOT=Path(os.environ.get('NOTION_MCP_VERIFY_ROOT', Path.home()/'notion-mcp-demo'))
 
 
 def request(method,params,url='http://127.0.0.1:8001/mcp'):
@@ -22,15 +25,17 @@ def tool(name,args,url='http://127.0.0.1:8001/mcp'):
     return json.loads(result['content'][0]['text'])
 
 
-def file_hash(path):return tool('get_path_hash',{'project':'browse','path':str(path)})['sha256']
+def file_hash(path):return tool('get_path_hash',{'project':PROJECT,'path':str(path)})['sha256']
 
 
-def save(name,value):(WORK/name).write_text(json.dumps(value,indent=2,ensure_ascii=False))
+def save(name,value):
+    WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (WORK/name).write_text(json.dumps(value,indent=2,ensure_ascii=False))
 def load(name):return json.loads((WORK/name).read_text())
 
 
 def prepare():
-    root=Path(tempfile.mkdtemp(prefix='linux-mcp-acceptance-',dir=Path.home()))
+    root=Path(tempfile.mkdtemp(prefix='notion-mcp-acceptance-',dir=PROJECT_ROOT))
     for name,text in [('edit.txt','before'),('copy.txt','copy source'),('move.txt','move source'),('rename.txt','rename source'),('delete.txt','recover me'),('conflict.txt','before')]:
         (root/name).write_text(text)
     (root/'tree').mkdir();(root/'tree/a.txt').write_text('directory child')
@@ -44,16 +49,16 @@ def prepare():
     for action,source,target in [('copy','copy.txt','copied.txt'),('move','move.txt','moved.txt'),('move','rename.txt','renamed.txt'),('copy','tree','copied-tree')]:
         operations.append({'operation':action,'path':str(root/source),'destination':str(root/target),'expectedHash':file_hash(root/source)})
     operations.append({'operation':'delete','path':str(root/'delete.txt'),'expectedHash':file_hash(root/'delete.txt')})
-    plan=tool('plan_file_operations',{'project':'browse','operations':operations})
-    conflict=tool('plan_files',{'project':'browse','changes':[{'path':str(root/'conflict.txt'),'expectedHash':file_hash(root/'conflict.txt'),'content':'must not overwrite user change'}]})
+    plan=tool('plan_file_operations',{'project':PROJECT,'operations':operations})
+    conflict=tool('plan_files',{'project':PROJECT,'changes':[{'path':str(root/'conflict.txt'),'expectedHash':file_hash(root/'conflict.txt'),'content':'must not overwrite user change'}]})
     if 'approvalId' not in plan or 'approvalId' not in conflict:raise RuntimeError('Preview failed; inspect local configuration')
     (root/'conflict.txt').write_text('user concurrent change')
     state={'root':str(root),'approvalId':plan['approvalId'],'conflictApprovalId':conflict['approvalId']}
     save('live-write-state.json',state)
     checks={'beforeApprovalRejected':'error' in tool('apply_change',{'approvalId':plan['approvalId']}),
-        'outsideLinkRejected':'error' in tool('read_text_file',{'project':'browse','path':str(root/'outside-link/passwd')}),
-        'sensitiveRejected':'error' in tool('read_text_file',{'project':'browse','path':str(root/'.env')}),
-        'ordinarySecretRedacted':'SYNTHETIC_TEST_SENTINEL_23847' not in json.dumps(tool('read_text_file',{'project':'browse','path':str(root/'ordinary.txt')}))}
+        'outsideLinkRejected':'error' in tool('read_text_file',{'project':PROJECT,'path':str(root/'outside-link/passwd')}),
+        'sensitiveRejected':'error' in tool('read_text_file',{'project':PROJECT,'path':str(root/'.env')}),
+        'ordinarySecretRedacted':'SYNTHETIC_TEST_SENTINEL_23847' not in json.dumps(tool('read_text_file',{'project':PROJECT,'path':str(root/'ordinary.txt')}))}
     save('live-write-checks.json',checks)
     print(json.dumps({'state':state,'checks':checks},indent=2))
 
@@ -65,7 +70,7 @@ def apply():
     checks=load('live-write-checks.json')
     checks.update({'createdDirectory':(root/'created-directory').is_dir(),'createdFile':(root/'created.txt').read_text()=='created by approved MCP',
         'binary':(root/'binary.bin').read_bytes()==b'\0\xffbinary',
-        'binaryReadViaMcp':base64.b64decode(tool('read_binary_file',{'project':'browse','path':str(root/'binary.bin')})['base64'])==b'\0\xffbinary',
+        'binaryReadViaMcp':base64.b64decode(tool('read_binary_file',{'project':PROJECT,'path':str(root/'binary.bin')})['base64'])==b'\0\xffbinary',
         'edited':(root/'edit.txt').read_text()=='after','copied':(root/'copied.txt').read_text()=='copy source',
         'moved':(root/'moved.txt').exists() and not (root/'move.txt').exists(),
         'renamed':(root/'renamed.txt').exists() and not (root/'rename.txt').exists(),'deleted':not (root/'delete.txt').exists(),
@@ -73,7 +78,7 @@ def apply():
         'replayRejected':'error' in tool('apply_change',{'approvalId':state['approvalId']}),
         'conflictRejected':'error' in tool('apply_change',{'approvalId':state['conflictApprovalId']}),
         'concurrentEditPreserved':(root/'conflict.txt').read_text()=='user concurrent change'})
-    restore=tool('restore_snapshot',{'project':'browse','snapshotId':state['approvalId']})
+    restore=tool('restore_snapshot',{'project':PROJECT,'snapshotId':state['approvalId']})
     state['restoreApprovalId']=restore['approvalId'];save('live-write-state.json',state);save('live-write-checks.json',checks)
     print(json.dumps({'checks':checks,'restoreApprovalId':restore['approvalId']},indent=2))
 

@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 
 from file_access import SECRET, sensitive, safe_output, within, open_components
+from credential_scan import first_finding
+from dev_diagnostics import DevelopmentDenied, application_status
 
 SKIP_DIRS = {'.git', '.ssh', '.aws', '.gnupg', '.config', 'node_modules', '.venv', 'venv', '__pycache__', '.pytest_cache', '.uv-cache', 'state', 'runtime', 'backups', '.scratch', '.cache', '.codex', '.local'}
 PRIVATE_DIRS = {'.git', '.ssh', '.aws', '.gnupg', '.config', '.codex'}
@@ -31,37 +33,58 @@ def digest(data):
 
 
 def generated_dependency(relative):
-    return any(part in DEPENDENCY_DIRS for part in Path(relative).parts)
+    parts = Path(relative).parts
+    return any(part in DEPENDENCY_DIRS for part in parts) or parts[:2] == ('.cache', 'ruff') or parts == ('.cache',)
 
 
-def possible_secret(data):
+def reject_secret(raw, relative, message):
+    finding = first_finding(raw, relative)
+    if finding:
+        rule = finding.pop('rule_id')
+        raise DevelopmentDenied(message, rule, relative, **finding)
+
+
+def possible_secret(data, path=None):
     markers = (b'password', b'passwd', b'secret', b'token', b'api', b'access', b'bearer ', b'private key', b'://', b'akia', b'ghp_', b'gho_', b'ghu_', b'ghs_', b'ghr_', b'sk-')
     lower = data.lower()
     if not any(marker in lower for marker in markers):
         return False
     # URI 分支从固定分隔符开始匹配；完整扫描保留跨窗口的凭据保护。
-    return bool(SECRET.search(data))
+    return bool(SECRET.search(data, path))
 
 
 def denied_relative(relative, policy, source=False):
     q = Path(relative)
     if q.is_absolute() or '..' in q.parts or not q.parts or '\0' in str(relative):
-        raise ValueError('Use workspace-relative path without traversal')
+        raise DevelopmentDenied('Use workspace-relative path without traversal', 'path.traversal', file_category='restricted_path')
     code = q.suffix.lower() in {'.py', '.ts', '.tsx', '.js', '.jsx', '.rs', '.go', '.java', '.c', '.cpp', '.h'}
     # 数据库只允许在隔离副本创建；宿主机数据库永不复制或同步。
     temp_db = not source and q.suffix.lower() in {'.db', '.db3', '.sqlite', '.sqlite3', '.sql'}
+    if not source and q.parts[0] == '.cache':
+        # 只接纳 Ruff 的隔离缓存容器；其他缓存路径继续按配置拒绝。
+        if q.parts == ('.cache',) or q.parts[:2] == ('.cache', 'ruff'):
+            if sensitive(q):
+                raise DevelopmentDenied('Sensitive cache path is excluded', 'path.sensitive', file_category='sensitive_path')
+            for pattern in policy.get('denyPaths', []):
+                if pattern != '.cache' and not Path(pattern).is_absolute() and (
+                    fnmatch.fnmatchcase(q.as_posix(), pattern) or fnmatch.fnmatchcase(q.name, pattern)
+                ):
+                    raise DevelopmentDenied('Path denied by execution profile', 'profile.deny_path', q, 'generated_cache')
+            return q
+        raise DevelopmentDenied('Path denied by execution profile', 'profile.deny_path', q, 'generated_cache')
     if source and generated_dependency(q):
-        raise ValueError('Generated dependencies cannot be copied or synchronized from the original project')
+        raise DevelopmentDenied('Generated dependencies cannot be copied or synchronized from the original project',
+                                'generated.source_export', q, 'generated_dependency')
     if not source and generated_dependency(q):
         if any(part == '.git' for part in q.parts):
             raise ValueError('Git internals are excluded from execution tree')
         if any(fnmatch.fnmatchcase(q.as_posix(), pattern) for pattern in policy.get('denyPaths', []) if not Path(pattern).is_absolute() and not any(part in DEPENDENCY_DIRS for part in Path(pattern).parts)):
-            raise ValueError('Path denied by execution profile')
+            raise DevelopmentDenied('Path denied by execution profile', 'profile.deny_path', q, 'generated_dependency')
         return q
     if any(p.lower() in PRIVATE_DIRS or p.lower() == '.env' or p.lower().startswith('.env.') or (source and p.lower() in SKIP_DIRS) or p.lower() in BLOCK_NAMES for p in q.parts) or (sensitive(q) and not code and not temp_db):
-        raise ValueError('Sensitive or execution-state path is excluded')
+        raise DevelopmentDenied('Sensitive or execution-state path is excluded', 'path.sensitive', file_category='sensitive_path')
     if any(fnmatch.fnmatchcase(q.as_posix(), p) or fnmatch.fnmatchcase(q.name, p) for p in policy.get('denyPaths', []) if not Path(p).is_absolute()):
-        raise ValueError('Path denied by execution profile')
+        raise DevelopmentDenied('Path denied by execution profile', 'profile.deny_path', q)
     return q
 
 
@@ -96,27 +119,30 @@ def manifest(root, policy, include_content=False):
             denied_relative(rel, policy)
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
-                raise ValueError('Workspace symbolic links are not exportable')
+                raise DevelopmentDenied('Workspace symbolic links are not exportable', 'path.symlink', rel, 'symbolic_link')
             if stat.S_ISDIR(info.st_mode):
                 output[rel] = {'type': 'directory', 'mode': stat.S_IMODE(info.st_mode)}
             else:
-                raw, mode = read_regular(root, rel, maximum)
-                if not generated_dependency(rel) and possible_secret(raw):
-                    raise ValueError('Possible secret detected; content withheld')
+                try:
+                    raw, mode = read_regular(root, rel, maximum)
+                except (ValueError, OSError) as error:
+                    raise DevelopmentDenied('Unsafe or unreadable workspace file', 'file.regular_bounded', rel, 'restricted_file') from error
+                if not generated_dependency(rel) or Path(rel).parts[0] == '.cache':
+                    reject_secret(raw, rel, 'Possible secret detected; content withheld')
                 total += len(raw)
                 if total > maximum:
-                    raise ValueError('Workspace disk budget exceeded')
+                    raise DevelopmentDenied('Workspace disk budget exceeded', 'resource.disk_bytes', rel)
                 output[rel] = {'type': 'file', 'hash': digest(raw), 'mode': mode, 'size': len(raw)}
                 if include_content:
                     output[rel]['data'] = base64.b64encode(raw).decode()
             if generated_dependency(rel):
                 generated_count += 1
                 if generated_count > generated_files:
-                    raise ValueError('Generated dependency file budget exceeded')
+                    raise DevelopmentDenied('Generated dependency file budget exceeded', 'resource.generated_files', rel, 'generated_dependency')
             elif output[rel]['type'] == 'file':
                 source_files += 1
             if source_files > files:
-                raise ValueError('Workspace file budget exceeded')
+                raise DevelopmentDenied('Workspace file budget exceeded', 'resource.files', rel)
     return output
 
 
@@ -209,21 +235,21 @@ def attach_workspace(cls):
         for part in q.parts:
             current = current / part
             if current.is_symlink():
-                raise ValueError('Original workspace symbolic link access refused')
+                raise DevelopmentDenied('Original workspace symbolic link access refused', 'path.source_symlink', q, 'symbolic_link')
         if any(within(target, private) or (write and within(private, target)) for private in self.private_paths):
-            raise ValueError('Administrator path is excluded from development')
+            raise DevelopmentDenied('Administrator path is excluded from development', 'path.administrator', file_category='administrator_path')
         spec = self.project(project)
         if not spec.get('read', True) or (write and not spec.get('write', False)):
             raise ValueError('Original project permission disabled')
         normal = q.as_posix()
         if any(fnmatch.fnmatchcase(normal, p) or fnmatch.fnmatchcase(q.name, p) for p in spec.get('deny', [])):
-            raise ValueError('Original project path denied')
+            raise DevelopmentDenied('Original project path denied', 'project.deny_path', q)
         if any(normal == p or normal.startswith(p + '/') for p in spec.get('denyDirs', [])):
-            raise ValueError('Original project directory denied')
+            raise DevelopmentDenied('Original project directory denied', 'project.deny_directory', q)
         if any(Path(p).is_absolute() and within(target, Path(p).resolve()) for p in policy.get('denyPaths', [])):
-            raise ValueError('Source path denied by profile')
+            raise DevelopmentDenied('Source path denied by profile', 'profile.source_scope', file_category='restricted_path')
         if write and not any(fnmatch.fnmatchcase(normal, p) for p in spec.get('writeAllow', [])):
-            raise ValueError('Original project write scope exceeded')
+            raise DevelopmentDenied('Original project write scope exceeded', 'project.write_allow', q)
         return target
 
     def dev_workspace(self, workspaceId, profile, allowExpired=False, allowClosed=False):
@@ -256,7 +282,10 @@ def attach_workspace(cls):
         return Path(meta.get('livePath') or meta['path'])
 
     def dev_path(self, meta, relative, policy):
-        q = denied_relative(relative, policy)
+        try:
+            q = denied_relative(relative, policy)
+        except DevelopmentDenied as error:
+            raise error.contextualize(meta['id'], 'path', 'preflight')
         root = self.dev_tree(meta)
         target = root / q
         # /proc 沙箱根具有内核提供的链接；只拒绝工作目录内的链接。
@@ -264,7 +293,7 @@ def attach_workspace(cls):
         for part in q.parts:
             current = current / part
             if current.is_symlink():
-                raise ValueError('Workspace symbolic links require an explicit export path')
+                raise DevelopmentDenied('Workspace symbolic links require an explicit export path', 'path.symlink', q, 'symbolic_link')
         return target
 
     def request(self, meta, requestId, operation, params):
@@ -287,7 +316,10 @@ def attach_workspace(cls):
     def finish(self, meta, requestId, result):
         meta['requests'][requestId].update(status='complete', result=result)
         self.dev_save_meta(meta)
-        self.audit_event('dev_mutation', 'ok', meta['project'])
+        self.audit_event('dev_mutation', application_status(result), meta['project'])
+        for item in result.get('results', []):
+            if item.get('diagnostic'):
+                self.audit.info(json.dumps({'event': 'development_denied', **item['diagnostic']}))
         return result
 
     def dev_workspace_create(self, profile, project, requestId):
@@ -311,6 +343,7 @@ def attach_workspace(cls):
         location = self.dev_root / wid; location.mkdir(mode=0o700)
         tree = location / 'tree'; tree.mkdir(mode=0o700)
         skipped = 0; baseline = {}; total = 0
+        skipped_reasons = {'path_or_link_or_io': 0, 'credential_content': 0}
         try:
             for directory, dirs, files in os.walk(source, followlinks=False):
                 keep = []
@@ -325,6 +358,7 @@ def attach_workspace(cls):
                         keep.append(name)
                     except (ValueError, OSError):
                         skipped += 1
+                        skipped_reasons['path_or_link_or_io'] += 1
                 dirs[:] = keep
                 for name in files:
                     rel = (Path(directory) / name).relative_to(source).as_posix()
@@ -334,10 +368,14 @@ def attach_workspace(cls):
                             raise ValueError('Link excluded')
                         self.dev_source_path(project, rel, policy)
                         raw, mode = read_regular(source, rel, policy.get('limits', {}).get('diskBytes', 512 * 1024 ** 2))
-                        if possible_secret(raw):
-                            raise ValueError('Possible credential excluded')
                     except (ValueError, OSError):
-                        skipped += 1; continue
+                        skipped += 1
+                        skipped_reasons['path_or_link_or_io'] += 1
+                        continue
+                    if possible_secret(raw, rel):
+                        skipped += 1
+                        skipped_reasons['credential_content'] += 1
+                        continue
                     total += len(raw)
                     if total > policy.get('limits', {}).get('diskBytes', 512 * 1024 ** 2) or len(baseline) >= policy.get('limits', {}).get('files', 30000):
                         raise ValueError('Source exceeds workspace resource budget')
@@ -346,7 +384,7 @@ def attach_workspace(cls):
                     baseline[rel] = {'hash': digest(raw), 'mode': mode, 'size': len(raw)}
             meta = {'id': wid, 'profile': profile, 'project': project, 'source': str(source), 'path': str(tree),
                     'privateRepository': str(location / 'repository'), 'artifactsPath': str(tree / '.dev-artifacts'),
-                    'baseline': baseline, 'changed': [], 'requests': {}, 'skippedEntries': skipped, 'created': time.time(), 'closed': False}
+                    'baseline': baseline, 'changed': [], 'requests': {}, 'skippedEntries': skipped, 'skippedReasonCounts': skipped_reasons, 'created': time.time(), 'closed': False}
             meta['initialHashes'] = {rel: data['hash'] for rel, data in baseline.items()}
             initial_head = subprocess.run(['git', '-C', str(source), 'rev-parse', '--verify', 'HEAD'], capture_output=True, timeout=5,
                                           env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'})
@@ -359,20 +397,31 @@ def attach_workspace(cls):
             raise
 
     def public(self, meta):
-        return {k: meta[k] for k in ('id', 'profile', 'project', 'created', 'skippedEntries', 'closed')} | {'workspaceId': meta['id'], 'gitScope': 'private-development-repository', 'changedPaths': meta['changed']}
+        return {k: meta[k] for k in ('id', 'profile', 'project', 'created', 'skippedEntries', 'closed')} | {'workspaceId': meta['id'], 'gitScope': 'private-development-repository', 'changedPaths': meta['changed'],
+            'executionState': meta.get('executionState', 'not_started'),
+            'skippedReasonCounts': meta.get('skippedReasonCounts', {}),
+            'sourceCopyComplete': meta.get('skippedEntries', 0) == 0,
+            'copyNotice': 'Excluded directories count as one entry; exclusions are not a complete project copy' if meta.get('skippedEntries') else None}
 
-    def dev_workspace_list(self, profile):
+    def dev_workspace_list(self, profile, workspaceId=None):
         self.dev_policy(profile)
+        if workspaceId is not None and (not isinstance(workspaceId, str) or not re.fullmatch(r'[0-9a-f]{32}', workspaceId)):
+            raise ValueError('Invalid development workspace filter')
         items = []
         for path in self.dev_root.glob('*/metadata.json'):
+            if workspaceId is not None and path.parent.name != workspaceId:
+                continue
             meta = json.loads(path.read_text())
             if meta['profile'] == profile:
                 items.append(self.dev_workspace_public(meta))
         return {'workspaces': items}
 
-    def dev_validate_tree(self, workspaceId, profile, allowExpired=False):
+    def dev_validate_tree(self, workspaceId, profile, allowExpired=False, operation='validation', phase='preflight'):
         meta = self.dev_workspace(workspaceId, profile, allowExpired=allowExpired)
-        entries = manifest(self.dev_tree(meta), self.dev_policy(profile))
+        try:
+            entries = manifest(self.dev_tree(meta), self.dev_policy(profile))
+        except DevelopmentDenied as error:
+            raise error.contextualize(workspaceId, operation, phase)
         return {'valid': True, 'files': len(entries), 'bytes': sum(x.get('size', 0) for x in entries.values())}
 
     def dev_read(self, profile, workspaceId, path, binary=False, offset=0, limit=65536):
@@ -392,8 +441,8 @@ def attach_workspace(cls):
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 262144:
             raise ValueError('Invalid read pagination')
         raw, _ = read_regular(root, relative, policy.get('limits', {}).get('diskBytes', 512 * 1024 ** 2))
-        if possible_secret(raw):
-            raise ValueError('Possible secret detected; content withheld')
+        if possible_secret(raw, path):
+            reject_secret(raw, path, 'Possible secret detected; content withheld')
         page = raw[offset:offset + limit]
         result = {'sha256': digest(raw), 'size': len(raw), 'offset': offset, 'truncated': offset + len(page) < len(raw), 'nextOffset': offset + len(page) if offset + len(page) < len(raw) else None}
         result['base64' if binary else 'text'] = base64.b64encode(page).decode() if binary else page.decode('utf-8', errors='replace')
@@ -427,8 +476,8 @@ def attach_workspace(cls):
             children = manifest(target, policy, True)
             return {'type': 'directory', 'mode': stat.S_IMODE(target.stat().st_mode), 'children': children, 'hash': digest(json.dumps(children, sort_keys=True).encode())}
         raw, mode = read_regular(root, relative, policy.get('limits', {}).get('diskBytes', 512 * 1024 ** 2))
-        if possible_secret(raw):
-            raise ValueError('Possible secret detected; content withheld')
+        if possible_secret(raw, relative):
+            reject_secret(raw, relative, 'Possible secret detected; content withheld')
         return {'type': 'file', 'hash': digest(raw), 'mode': mode, 'data': base64.b64encode(raw).decode()}
 
     def atomic_write(self, root, relative, raw, mode, expected):
@@ -551,10 +600,12 @@ def attach_workspace(cls):
                 if not isinstance(op, dict) or op.get('operation') not in {'write', 'mkdir', 'copy', 'move', 'rename', 'delete'}:
                     raise ValueError('Unsupported file operation')
                 kind = op['operation']; path = op['path']; target = self.dev_path(meta, path, policy)
+                if generated_dependency(path):
+                    raise DevelopmentDenied('Generated dependency mutations require isolated execution', 'generated.file_tool', path, 'generated_dependency')
                 entry = self.dev_tree_entry(root, path, policy)
                 expected = op.get('expectedHash', 'missing' if kind == 'mkdir' else None)
                 if expected is None or entry['hash'] != expected:
-                    raise ValueError('Hash conflict: expectedHash does not match')
+                    raise DevelopmentDenied('Hash conflict: expectedHash does not match', 'write.expected_hash', path)
                 before.setdefault(path, entry)
                 dest = None; dest_entry = None
                 if kind in {'copy', 'move', 'rename'}:
@@ -574,11 +625,10 @@ def attach_workspace(cls):
                     if ('content' in op) == ('base64Content' in op):
                         raise ValueError('Supply exactly one text or binary content')
                     raw = op['content'].encode() if 'content' in op else base64.b64decode(op['base64Content'], validate=True)
-                    if possible_secret(raw):
-                        raise ValueError('Possible secret detected; write refused')
+                    reject_secret(raw, path, 'Possible secret detected; write refused')
                     if entry['type'] not in {'file', 'missing'}:
                         raise ValueError('Write target must be a file')
-                    used = self.dev_validate_tree(workspaceId, profile)['bytes']
+                    used = self.dev_validate_tree(workspaceId, profile, operation='dev_write')['bytes']
                     if used - len(base64.b64decode(entry.get('data', ''))) + len(raw) > policy.get('limits', {}).get('diskBytes', 512 * 1024 ** 2):
                         raise ValueError('Workspace disk budget exceeded')
                     self.dev_atomic_write(root, path, raw, entry.get('mode', 0o600), expected)
@@ -626,6 +676,9 @@ def attach_workspace(cls):
                         pass
                 message = str(error) if isinstance(error, ValueError) else type(error).__name__
                 results.append({'path': op.get('path') if isinstance(op, dict) else None, 'applied': False, 'error': safe_output(message[:200])})
+                if isinstance(error, DevelopmentDenied):
+                    error.contextualize(workspaceId, 'dev_' + op.get('operation', 'operations'), 'preflight')
+                    results[-1]['diagnostic'] = error.diagnostic
                 break
             finally:
                 self.atomic_json(record_path, {'id': sid, 'scope': 'workspace', 'before': before, 'after': after, 'created': time.time()})
@@ -734,10 +787,10 @@ def attach_workspace(cls):
         result = self.dev_write(profile, workspaceId, path, expectedHash, internal_request, content=text)
         return self.dev_finish(meta, requestId, result)
 
-    def dev_sync(self, profile, workspaceId, paths, requestId):
+    def sync_files(self, profile, workspaceId, paths, requestId):
         policy = self.dev_policy(profile); meta = self.dev_workspace(workspaceId, profile)
         source = self.dev_check_source(meta['project'], policy, True)
-        self.dev_validate_tree(workspaceId, profile)
+        self.dev_validate_tree(workspaceId, profile, operation='dev_sync', phase='sync')
         if not isinstance(paths, list) or not 1 <= len(paths) <= 100 or len(set(paths)) != len(paths):
             raise ValueError('Supply 1 to 100 unique task file paths')
         cached, _ = self.dev_request(meta, requestId, 'sync', paths)
@@ -755,7 +808,7 @@ def attach_workspace(cls):
             old = self.dev_tree_entry(source, rel, policy)
             expected = meta['baseline'].get(rel, {}).get('hash', 'missing')
             if old['hash'] != expected:
-                raise ValueError('Source hash conflict: concurrent user change')
+                raise DevelopmentDenied('Source hash conflict: concurrent user change', 'sync.expected_hash', rel)
             new = self.dev_tree_entry(root, rel, policy)
             if old['type'] == 'directory' or new['type'] == 'directory':
                 raise ValueError('Synchronize explicit files; directory-wide sync is forbidden')
@@ -776,10 +829,18 @@ def attach_workspace(cls):
                 results.append({'path': rel, 'applied': True})
             except Exception as error:
                 results.append({'path': rel, 'applied': False, 'error': str(error)[:200] if isinstance(error, ValueError) else type(error).__name__})
+                if isinstance(error, DevelopmentDenied):
+                    results[-1]['diagnostic'] = error.contextualize(workspaceId, 'dev_sync', 'sync').diagnostic
                 break
             finally:
                 self.atomic_json(record_path, {'id': sid, 'scope': 'source', 'before': before, 'after': after, 'created': time.time()})
         return self.dev_finish(meta, requestId, {'snapshotId': sid, 'applied': len(results) == len(paths) and all(x['applied'] for x in results), 'results': results, 'transactional': False})
+
+    def dev_sync(self, profile, workspaceId, paths, requestId):
+        try:
+            return sync_files(self, profile, workspaceId, paths, requestId)
+        except DevelopmentDenied as error:
+            raise error.contextualize(workspaceId, 'dev_sync', 'sync')
 
     def dev_restore(self, profile, workspaceId, snapshotId, requestId):
         policy = self.dev_policy(profile); meta = self.dev_workspace(workspaceId, profile)
@@ -840,7 +901,7 @@ def attach_workspace(cls):
                         old, _ = self.read(meta['project'], rel)
                     except (ValueError, OSError):
                         old = b''
-                    if not possible_secret(old):
+                    if not possible_secret(old, rel):
                         row['diff'] = ''.join(difflib.unified_diff(old.decode('utf-8', 'replace').splitlines(True), raw.decode('utf-8', 'replace').splitlines(True), fromfile=rel, tofile=rel))
             used += len(json.dumps(row).encode())
             if used > 131072:
@@ -880,7 +941,7 @@ def attach_workspace(cls):
             denied_relative(rel, policy)
             original = subprocess.run(['git', '-C', str(source), 'show', (head or 'HEAD') + ':' + rel], capture_output=True, timeout=10,
                                       env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'})
-            if original.returncode or len(original.stdout) > 2 * 1024 ** 2 or possible_secret(original.stdout):
+            if original.returncode or len(original.stdout) > 2 * 1024 ** 2 or possible_secret(original.stdout, rel):
                 continue
             dest = repo / rel; dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(original.stdout)
             original_hashes[rel] = digest(original.stdout)
@@ -953,7 +1014,7 @@ def attach_workspace(cls):
                 target = repo / rel; current = self.dev_tree_entry(tree, rel, policy)
                 if target.is_file():
                     raw, mode = read_regular(repo, rel, 2 * 1024 ** 2)
-                    if possible_secret(raw):
+                    if possible_secret(raw, rel):
                         raise ValueError('Merged content failed secret check')
                     self.dev_atomic_write(tree, rel, raw, current.get('mode', mode), current['hash'])
                 elif current['type'] != 'missing':
@@ -978,9 +1039,15 @@ def attach_workspace(cls):
         return {'artifacts': [{'path': p, 'sha256': entries[p]['hash'], 'size': entries[p]['size']} for p in paths[offset:offset + limit]], 'hasMore': offset + limit < len(paths)}
 
     def dev_workspace_close(self, profile, workspaceId):
-        meta = self.dev_workspace(workspaceId, profile, allowExpired=True)
+        meta = self.dev_workspace(workspaceId, profile, allowExpired=True, allowClosed=True)
+        if meta.get('closed'):
+            return {'closed': True, 'workspaceId': workspaceId, 'snapshotsRetained': True,
+                    'artifactsRetained': bool(meta.get('retainedArtifactRoot'))}
         if meta.get('livePath'):
             raise ValueError('Stop execution sandbox before closing workspace')
+        executor = getattr(self, 'dev_executor', None)
+        if meta.get('changed') and (executor is None or not executor.preservation_valid(meta)):
+            raise ValueError('Complete workspace preservation is required before closing modified files')
         artifact_root = Path(meta['path']) / '.dev-artifacts'
         if artifact_root.is_dir() and not artifact_root.is_symlink():
             retained = self.dev_root / workspaceId / 'artifacts'
@@ -1016,7 +1083,7 @@ P = {'type': 'array', 'items': S, 'minItems': 1, 'maxItems': 100, 'uniqueItems':
 R = {'type': 'string', 'pattern': '^[a-zA-Z0-9_-]{1,100}$'}
 TOOL_DESCRIPTIONS = {
     'dev_workspace_create': '创建不含凭据、运行数据库和 Git 私有文件的开发副本，无需逐项审批。',
-    'dev_workspace_list': '列出开发副本及状态。',
+    'dev_workspace_list': '列出开发副本及状态；可按 workspaceId 精确筛选，包含过期和已关闭副本。',
     'dev_workspace_close': '关闭已停止沙箱的开发副本，保留恢复快照。',
     'dev_read': '分页读取开发副本文本或二进制并返回完整文件哈希。',
     'dev_list': '分页列出开发副本目录，支持普通隐藏文件。',

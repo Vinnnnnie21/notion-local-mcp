@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Local operator CLI. This file/state must NEVER be in an MCP project root."""
-import argparse,json,os,secrets,time
+import argparse,json,os,secrets,time,hashlib
 from file_access import canonical, hashed
 from pathlib import Path
 from core import Backend
+from dev_execution import approve_recovery
 DEFAULT=Path(os.environ.get('NOTION_MCP_HOME', Path.home()/'.config/notion-local-mcp'))
 p=argparse.ArgumentParser(); p.add_argument('--config',default=str(DEFAULT/'config.json'))
 s=p.add_subparsers(dest='action',required=True)
@@ -11,6 +12,7 @@ init=s.add_parser('init'); init.add_argument('--project',required=True); init.ad
 review=s.add_parser('approve'); review.add_argument('id')
 s.add_parser('health'); s.add_parser('rotate-key'); s.add_parser('validate-config')
 s.add_parser('restart')
+recovery=s.add_parser('recovery-approve'); recovery.add_argument('id')
 grant=s.add_parser('authorize-sensitive'); grant.add_argument('--path',required=True); grant.add_argument('--minutes',type=int,default=30); grant.add_argument('--write',action='store_true')
 prune=s.add_parser('prune'); prune.add_argument('--days',type=int,default=30)
 a=p.parse_args(); path=Path(a.config).expanduser()
@@ -52,6 +54,18 @@ else:
         cfg=json.loads(path.read_text()); cfg.setdefault('sensitiveGrants',[]).append({'path':str(target),'read':True,'write':a.write,'expires':time.time()+a.minutes*60})
         backend.atomic_json(path,cfg); print('Saved. Validate and restart MCP locally to load this authorization.')
     elif a.action=='health': print(json.dumps(backend.health(),ensure_ascii=False,indent=2))
+    elif a.action=='recovery-approve':
+        if len(a.id)!=32 or any(c not in '0123456789abcdef' for c in a.id): raise SystemExit('Invalid recovery ID')
+        file=backend.state/'development-recovery'/(a.id+'.json')
+        if not file.is_file(): raise SystemExit('Recovery request not found')
+        record=json.loads(file.read_text())
+        if record.get('status')!='pending' or record.get('approved') or record.get('expires',0)<time.time(): raise SystemExit('Recovery is already approved, expired, or not pending')
+        preview={k:record.get(k) for k in ('recoveryId','workspaceId','profile','scope','blockers','treeHash','configHash','expires')}
+        print('精确恢复申请：')
+        print(json.dumps(preview,ensure_ascii=False,indent=2))
+        if input('审阅以上安全事件和文件哈希。输入 APPROVE RECOVERY: ')!='APPROVE RECOVERY': raise SystemExit('Cancelled')
+        result=approve_recovery(path, a.id, 'APPROVE RECOVERY')
+        print('Recovery approved once. Apply through MCP before expiry.')
     elif a.action=='approve':
         if len(a.id)!=32 or any(c not in '0123456789abcdef' for c in a.id): raise SystemExit('Invalid approval ID')
         file=backend.state/'approvals'/(a.id+'.json'); record=json.loads(file.read_text())

@@ -196,13 +196,7 @@ def attach_services(cls):
         if profile != PROFILE:
             raise ValueError('This operation requires an isolated autonomous-development workspace')
         self.dev_policy(profile)
-        if control:
-            try:
-                return self.dev_workspace(workspaceId, profile, allowExpired=True)
-            except TypeError:
-                # Keep the service helpers usable with small test doubles.
-                return self.dev_workspace(workspaceId, profile)
-        return self.dev_workspace(workspaceId, profile)
+        return self.dev_workspace(workspaceId, profile,allowExpired=True) if control else self.dev_workspace(workspaceId, profile)
 
     def execute(self, profile, workspaceId, argv, timeout=30, requestId=None, background=False,control=False,diagnostic=False):
         check(self, profile, workspaceId,control)
@@ -346,9 +340,32 @@ result={'python':sys.executable,'offlineCache':str(cache),'offlineCacheAvailable
 if deps.is_dir():
  sys.path.insert(0,str(deps));import importlib;importlib.invalidate_caches();result['installedInDependencyTarget']={name:bool(importlib.util.find_spec(name)) for name in ['pytest','ruff']}
 else:result['installedInDependencyTarget']={'pytest':False,'ruff':False}
+# 固定只读检查：不加载项目模块、不安装依赖、不启动业务代码。
+import subprocess,shutil,re
+
+def version(command):
+ try:
+  completed=subprocess.run(command,capture_output=True,timeout=2)
+  value=completed.stdout[:100].decode('ascii',errors='replace').strip()
+  return value if completed.returncode==0 and re.fullmatch(r'v?[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?',value) else None
+ except (OSError,subprocess.TimeoutExpired):return None
+node_version=version(['node','--version']);npm_version=version(['npm','--version'])
+match=re.fullmatch(r'v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+][A-Za-z0-9.-]+)?',node_version or '')
+parts=tuple(map(int,match.groups())) if match else None
+result['selectedNode']={'executable':shutil.which('node'),'version':node_version,'supportsModernVite':bool(parts and ((parts[0]==20 and parts>=(20,19,0)) or parts>=(22,12,0)))}
+result['selectedNpm']={'executable':shutil.which('npm'),'version':npm_version}
+result['node']=node_version is not None;result['npm']=npm_version is not None
+result['offlineNpmCache']={'path':'/opt/dependency-cache/npm','available':pathlib.Path('/opt/dependency-cache/npm').is_dir(),'readOnly':True}
+probe="const r=require('node:module').createRequire('/workspace/package.json');console.log(JSON.stringify(Object.fromEntries(['react','react-dom','typescript','vite','vitest','@fluentui/react-components'].map(n=>{try{r.resolve(n);return[n,true]}catch{return[n,false]}}))))"
+try:
+ completed=subprocess.run(['node','-e',probe],capture_output=True,timeout=2)
+ result['frontendModulesResolvable']=json.loads(completed.stdout[:4096]) if completed.returncode==0 else None
+except (OSError,ValueError,subprocess.TimeoutExpired):result['frontendModulesResolvable']=None
+result['frontendResolutionBase']='/workspace/package.json'
+result['readinessScope']='Root-workspace version and resolution checks only; nested app dependencies require a working-directory-specific check; not a project build or dependency-lock verification'
 print(json.dumps(result))
 """
-        return pyjson(self,profile,workspaceId,code,{},10,diagnostic=True)
+        return pyjson(self,profile,workspaceId,code,{},15,diagnostic=True)
 
     def dev_runtime_query(self,profile,targetId,sql,parameters=None,offset=0,limit=100,timeout=5):
         if profile!='readonly-runtime':raise ValueError('Runtime query requires readonly-runtime profile')
@@ -416,7 +433,10 @@ print(json.dumps(result))
         except Exception:raise ValueError('Fixed readonly HTTP request failed; response and credentials withheld') from None
 
     def dev_service_start(self, profile, workspaceId, argv, port, requestId, timeout=120):
-        check(self,profile,workspaceId);integer(port,1024,65535);integer(timeout,1,3600)
+        check(self,profile,workspaceId);integer(port,1024,65535)
+        limits=self.dev_policy(profile).get('limits',{})
+        maximum=limits.get('maxTimeoutSeconds',600)
+        integer(maximum,1,3600);integer(timeout,1,maximum)
         if not isinstance(requestId,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',requestId):raise ValueError('Invalid service requestId')
         key=(workspaceId,requestId)
         summary=hashlib.sha256(json.dumps([argv,port,timeout]).encode()).hexdigest()

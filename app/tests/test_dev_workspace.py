@@ -241,7 +241,7 @@ class Workspaces(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get('NOTION_MCP_RUN_INTEGRATION') == '1', 'requires the registered offline dependency cache')
     def test_actual_cached_wheel_files_validate_without_exposure(self):
-        cache = Path(os.environ.get('NOTION_MCP_PYTHON_CACHE', '/opt/dependency-cache/python'))
+        cache = Path(os.environ.get('NOTION_MCP_PYTHON_CACHE', '/opt/notion-local-mcp/dependency-cache/python'))
         wheel = next(iter(cache.glob('packaging-*.whl')), None)
         if wheel is None:
             self.skipTest('Local registered offline dependency cache unavailable')
@@ -259,8 +259,7 @@ class Workspaces(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get('NOTION_MCP_RUN_INTEGRATION') == '1', 'requires the isolated executor and offline dependency cache')
     def test_actual_offline_pip_install_in_isolated_workspace(self):
-        cache = Path(os.environ.get('NOTION_MCP_PYTHON_CACHE', '/opt/dependency-cache/python'))
-        if not hasattr(self.backend, 'dev_executor') or not cache.is_dir():
+        if not hasattr(self.backend, 'dev_executor') or not Path(os.environ.get('NOTION_MCP_PYTHON_CACHE', '/opt/notion-local-mcp/dependency-cache/python')).is_dir():
             self.skipTest('Integrated isolated executor or offline cache unavailable')
         limits = self.cfg['executionProfiles'][self.profile]['limits']
         limits.update(diskBytes=64 * 1024 ** 2, maxWorkspaceBytes=64 * 1024 ** 2, maxMemoryBytes=512 * 1024 ** 2, maxWorkspaceSeconds=60, maxTimeoutSeconds=30, maxRepairRounds=8)

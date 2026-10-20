@@ -13,6 +13,7 @@ from starlette.routing import Route, Mount
 import uvicorn
 from core import Backend,VERSION,OUTPUT_LIMIT
 from file_access import safe_output, error_code, within, sensitive
+from dev_diagnostics import application_status, diagnostic_for, DevelopmentDenied
 
 DESCRIPTIONS={
  'list_projects':'List configured project IDs and enabled permissions. Never guess project IDs.',
@@ -69,6 +70,11 @@ DESCRIPTIONS.update({
  'validate_configuration':'Read current validated configuration summary and hash without private values.',
  'plan_service_restart':'Preview restart of this MCP service only. Independent local administrator approval required.',
  'apply_service_restart':'Schedule a single locally approved MCP restart. Never replay automatically; reconnect and check health.'})
+DESCRIPTIONS.update({
+ 'dev_execution_diagnose':'Read project-level execution safety blockers, related tasks and workspaces. Cleanup releases resources but does not clear the block.',
+ 'dev_execution_preserve':'Create a complete private preservation copy before closing a modified development workspace. A failed preservation keeps the original tree.',
+ 'dev_execution_request_recovery':'Create a time-limited local recovery request bound to one safety event, workspace tree hash and configuration hash. Does not approve it.',
+ 'dev_execution_apply_recovery':'Apply one unused locally approved recovery request after rechecking the exact safety event, hashes, stopped resources and safe tree.'})
 DESCRIPTIONS['restore_snapshot']='Preview restoration of completed changes, including recoverable deletion/overwrite and new files. Current hashes checked. Local approval required.'
 PLATFORM_MODULES = []
 for module_name in ('dev_workspace', 'dev_execution', 'dev_services', 'dev_maintenance'):
@@ -76,7 +82,7 @@ for module_name in ('dev_workspace', 'dev_execution', 'dev_services', 'dev_maint
     PLATFORM_MODULES.append(module)
     DESCRIPTIONS.update(module.TOOL_DESCRIPTIONS)
 PLATFORM_SCHEMAS = {name: spec for module in PLATFORM_MODULES for name, spec in module.TOOL_SCHEMAS.items()}
-PLATFORM_READONLY = {'dev_workspace_list', 'dev_read', 'dev_list', 'dev_diff', 'dev_artifacts', 'dev_task_status', 'dev_output', 'dev_service_status', 'dev_runtime_query', 'dev_runtime_status', 'dev_runtime_http', 'dev_environment_ready'}
+PLATFORM_READONLY = {'dev_workspace_list', 'dev_read', 'dev_list', 'dev_diff', 'dev_artifacts', 'dev_task_status', 'dev_output', 'dev_service_status', 'dev_runtime_query', 'dev_runtime_status', 'dev_runtime_http', 'dev_environment_ready', 'dev_execution_diagnose'}
 
 READONLY=set(DESCRIPTIONS)-{'apply_change','apply_git','run_project_task','cancel_task','build_index','apply_service_restart'}
 READONLY.difference_update(set(PLATFORM_SCHEMAS) - PLATFORM_READONLY)
@@ -114,6 +120,12 @@ def tool_schema(fn):
         else: required.append(name)
         properties[name]=schema
     return {'type':'object','properties':properties,'required':required,'additionalProperties':False}
+
+def safe_tool_output(name, arguments, value):
+    source_aware = {'read_text_file', 'read_file_lines', 'dev_read', 'git_diff'}
+    source_path = arguments.get('path') if name in source_aware and isinstance(arguments, dict) else None
+    return safe_output(value, source_path)
+
 
 class Guard:
     def __init__(self,app,token_path,audit=None,limits=None):
@@ -226,17 +238,23 @@ def make_app(config,token_path):
         try:
             jsonschema.validate(arguments,schemas[name])
             result=await asyncio.to_thread(execute,name,arguments)
-            backend.audit_event(name,'ok',arguments.get('project'),paths=[arguments['path']] if isinstance(arguments.get('path'),str) else None)
+            backend.audit_event(name,application_status(result),arguments.get('project'),paths=[arguments['path']] if isinstance(arguments.get('path'),str) else None)
             if name=='document_preview' and result.get('kind')=='image':
                 encoded=result.pop('base64')
                 return [types.ImageContent(type='image',mimeType=result['mimeType'],data=encoded),types.TextContent(type='text',text=json.dumps(result,ensure_ascii=False))]
-            output=json.dumps(safe_output(result),ensure_ascii=False)
+            output=json.dumps(safe_tool_output(name,arguments,result),ensure_ascii=False)
             if len(output.encode())>3*1024*1024: raise ValueError('Tool result too large')
             return [types.TextContent(type='text',text=output)]
         except Exception as error:
             backend.audit_event(name,'error',arguments.get('project'),paths=[arguments['path']] if isinstance(arguments.get('path'),str) else None)
             # Avoid SDK tracebacks leaking absolute paths/private state.
             message=error_code(error) if not isinstance(error,jsonschema.exceptions.ValidationError) else 'Invalid tool arguments; use the tool schema'
+            if isinstance(error,DevelopmentDenied):
+                diagnostic=diagnostic_for(error,arguments.get('workspaceId'),name,
+                    'sync' if name=='dev_sync' else 'cleanup' if 'cleanup' in name else 'preflight')
+                backend.audit.info(json.dumps({'event':'development_denied',**diagnostic}))
+                return types.CallToolResult(content=[types.TextContent(type='text',
+                    text=json.dumps({'error':str(error),'diagnostic':diagnostic}))],isError=True)
             if '/' in message and not isinstance(error,ValueError): message='Operation failed'
             if getattr(error, 'classification', None):
                 message=json.dumps({'error':message,'code':error.code,

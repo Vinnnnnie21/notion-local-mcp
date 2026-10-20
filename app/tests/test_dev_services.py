@@ -15,8 +15,8 @@ class Dummy:
         self.calls=[];self.status={'status':'running','stdout':'{"ready":true}'};self.next_stdout='{"columns":["n"],"rows":[[1]],"readonly":false}'
     def dev_policy(self, profile):
         if profile!='autonomous-development':raise ValueError('disabled')
-        return {'enabled':True}
-    def dev_workspace(self, workspaceId, profile):
+        return {'enabled':True,'limits':{'maxTimeoutSeconds':600}}
+    def dev_workspace(self, workspaceId, profile, **kwargs):
         if workspaceId!='w':raise ValueError('unknown')
         return {'path':'/unused'}
     def dev_exec_internal(self, profile, workspaceId, **kwargs):
@@ -34,7 +34,7 @@ class Tests(unittest.TestCase):
         shutil.rmtree(self.b.state)
     def start(self):return self.b.dev_service_start(**self.c,argv=['python3','server.py'],port=18080,requestId='service')
     def test_url_host_boundary(self):
-        for u in ['http://localhost:18080','http://127.0.0.1:8001','https://127.0.0.1:18080','http://user:pass@127.0.0.1:18080','http://127.0.0.1:18080/#x','file:///etc/passwd','http://binance.com:18080']:
+        for u in ['http://localhost:18080','http://127.0.0.1:8001','https://127.0.0.1:18080','http://user:pass@127.0.0.1:18080','http://127.0.0.1:18080/#x','file:///etc/passwd','http://example.com:18080']:
             with self.subTest(u=u),self.assertRaises(ValueError):origin(u,[18080])
     def test_relative_boundary(self):
         for p in ['../a','/tmp/a','x/../a','a//b','a\\b','.ssh/key','.config/x']:
@@ -65,6 +65,15 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):self.b.dev_db(**self.c,path='a.txt',sql='SELECT 1',readonly=True)
     def test_service_idempotency(self):
         self.assertEqual(self.start(),self.start());self.assertEqual(len(self.b.calls),1)
+    def test_invalid_service_timeout_does_not_reserve_port(self):
+        with self.assertRaises(ValueError):
+            self.b.dev_service_start(**self.c,argv=['python3','server.py'],port=18080,requestId='service',timeout=1800)
+        self.assertEqual(self.b.calls,[])
+        self.assertFalse(self.b.dev_services_registry)
+        started=self.start()
+        self.assertEqual(started['state'],'registered')
+        self.assertEqual(started['port'],18080)
+        self.assertEqual(len(self.b.calls),1)
     def test_service_id_different_argv(self):
         self.start()
         with self.assertRaises(ValueError):self.b.dev_service_start(**self.c,argv=['sh'],port=18080,requestId='service')

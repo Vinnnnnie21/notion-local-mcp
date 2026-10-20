@@ -20,7 +20,7 @@ MAX_NODES = 2000
 PRIVATE_TEMP = re.compile(r'^\.mcp-(?:stage|recovery|tmp)-[0-9a-f]+$')
 SENSITIVE_DIRS = {'.ssh', '.aws', '.gnupg', '.kube', '.azure', '.docker', 'credentials', 'secrets'}
 SENSITIVE_NAMES = {'credentials', 'credential', 'token', 'tokens', 'id_rsa', 'id_ed25519', 'id_dsa', 'id_ecdsa', 'authorized_keys', '.netrc', '.npmrc', '.pypirc', 'passwd', 'shadow'}
-SECRET = re.compile(rb'(?im)(PRIVATE KEY-----|(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\s*[=:]\s*["\']?[^\s"\',;]{4,}|Bearer\s+[A-Za-z0-9._~+/-]{12,}|://[^\s/:]+:[^\s/@]+@|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})')
+from credential_scan import SECRET, findings as credential_findings
 
 
 def hashed(data):
@@ -31,19 +31,163 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
 
 
+def _credential_span(data, start, limit):
+    """Find one credential expression without consuming the rest of its source line."""
+    while start < limit and data[start:start + 1] in b' \t':
+        start += 1
+    if start >= limit:
+        return start, start
+    first = data[start:start + 1]
+    if first in (b'"', b"'"):
+        quote = first
+        index = start + 1
+        while index < limit:
+            if data[index:index + 1] == b'\\':
+                index += 2
+                continue
+            if data[index:index + 1] == quote:
+                return start, index + 1
+            index += 1
+        return start, limit
+
+    pairs = {ord('{'): ord('}'), ord('('): ord(')'), ord('['): ord(']')}
+    closers = {value for value in pairs.values()}
+    stack = []
+    quote = None
+    index = start
+    while index < limit:
+        current = data[index]
+        if quote is not None:
+            if current == ord('\\'):
+                index += 2
+                continue
+            if current == quote:
+                quote = None
+            index += 1
+            continue
+        if current in (ord('"'), ord("'"), ord('`')):
+            quote = current
+        elif current in pairs:
+            stack.append(pairs[current])
+        elif current in closers:
+            if not stack:
+                break
+            if current != stack[-1]:
+                break
+            stack.pop()
+            if not stack:
+                index += 1
+                break
+        elif current in (ord(','), ord(';'), ord('\n'), ord('\r')) and not stack:
+            break
+        index += 1
+    end = index
+    while end > start and data[end - 1:end] in b' \t':
+        end -= 1
+    return start, max(start, end)
+
+
+def _credential_literal_spans(data, start, end, source_path):
+    """Return literal payloads in one finding, preserving its surrounding code."""
+    suffix = Path(str(source_path or '')).suffix.lower()
+    python = suffix == '.py'
+    spans = []
+    index = start
+    while index < end:
+        current = data[index]
+        following = data[index + 1:index + 2]
+        if python and current == ord('#'):
+            newline = data.find(b'\n', index, end)
+            if newline < 0:
+                break
+            index = newline + 1
+            continue
+        if not python and data[index:index + 2] == b'//':
+            newline = data.find(b'\n', index, end)
+            if newline < 0:
+                break
+            index = newline + 1
+            continue
+        if not python and data[index:index + 2] == b'/*':
+            close = data.find(b'*/', index + 2, end)
+            if close < 0:
+                break
+            index = close + 2
+            continue
+        if current in (ord('"'), ord("'"), ord('`')):
+            quote = current
+            content_start = index + 1
+            cursor = content_start
+            while cursor < end:
+                if data[cursor] == ord('\\'):
+                    cursor += 2
+                    continue
+                if data[cursor] == quote:
+                    if cursor > content_start:
+                        spans.append((content_start, cursor))
+                    index = cursor + 1
+                    break
+                cursor += 1
+            else:
+                if end > content_start:
+                    spans.append((content_start, end))
+                break
+            continue
+        index += 1
+    return spans
+
+
 def within(path, root):
     return path == root or root in path.parents
 
 
-def safe_output(value):
+def safe_output(value, source_path=None):
     if isinstance(value, str):
-        if SECRET.search(value.encode()):
-            return '[REDACTED: possible credential content]'
-        return value
+        data = value.encode()
+        replacements = []
+        for match, rule, _ in credential_findings(data, source_path):
+            if rule == 'secret.signature':
+                start, end = match.span()
+            else:
+                value_start, value_end = match.span('value')
+                if value_start < 0 or value_end <= value_start:
+                    continue
+                if (match['separator'] == b':' and str(source_path or '').lower().endswith('.py')):
+                    typed_value = re.match(
+                        rb'\s*(?:str|string|bytes|int|integer|float|bool|boolean|object|Any|None|Optional\[[^\]\n]{1,80}\])\s*=\s*',
+                        data[value_start:value_end], re.I)
+                    if typed_value:
+                        value_start += typed_value.end()
+                literal_spans = _credential_literal_spans(data, value_start, value_end, source_path)
+                if literal_spans:
+                    replacements.extend(literal_spans)
+                    continue
+                start, end = value_start, value_end
+                if start >= end:
+                    continue
+            replacements.append((start, end))
+        if not replacements:
+            return value
+        # 合并重叠的发现，防止同一凭据被不同规则重复处理。
+        replacements.sort()
+        merged = []
+        for start, end in replacements:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        for start, end in reversed(merged):
+            data = data[:start] + b'[REDACTED]' + data[end:]
+        return data.decode('utf-8', errors='replace')
     if isinstance(value, list):
-        return [safe_output(x) for x in value]
+        return [safe_output(x, source_path) for x in value]
     if isinstance(value, dict):
-        return {k: safe_output(v) for k, v in value.items()}
+        context = source_path
+        if context is None and isinstance(value.get('path'), str):
+            context = value['path']
+        elif context is None and isinstance(value.get('paths'), list) and len(value['paths']) == 1 and isinstance(value['paths'][0], str):
+            context = value['paths'][0]
+        return {k: safe_output(v, context) for k, v in value.items()}
     return value
 
 
@@ -253,12 +397,12 @@ def attach_file_access(cls):
         if b'\0' in raw:
             raise ValueError('Binary data; use read_binary_file')
         target = self.allowed(project, path)
-        text = '[REDACTED: sensitive file content stays local]' if sensitive(target) else safe_output(raw.decode('utf-8'))
+        text = '[REDACTED: sensitive file content stays local]' if sensitive(target) else safe_output(raw.decode('utf-8'), path)
         return {'text': text, 'sha256': hashed(raw), 'bytes': len(raw), 'contentRedacted': sensitive(target) or text != raw.decode('utf-8')}
 
     def read_binary_file(self, project, path):
         raw, _ = self.read(project, path)
-        if sensitive(self.allowed(project, path)) or SECRET.search(raw):
+        if sensitive(self.allowed(project, path)) or SECRET.search(raw, path):
             raise ValueError('Sensitive bytes are not returned to chat')
         return {'base64': base64.b64encode(raw).decode(), 'sha256': hashed(raw), 'bytes': len(raw)}
 
@@ -584,7 +728,7 @@ def attach_file_access(cls):
             previews.append({'operation': action, 'paths': [str(x) for x in touched], 'linkMode': link_mode,
                              'beforeHashes': {p: self.node_hash(v) for p, v in before.items()},
                              'afterHashes': {p: self.node_hash(v) for p, v in after.items()},
-                             'contentPreview': '[REDACTED: sensitive path]' if any(sensitive(x) for x in touched) else safe_output(op.get('content', 'Binary/directory payload: hash only')[:8192]),
+                             'contentPreview': '[REDACTED: sensitive path]' if any(sensitive(x) for x in touched) else safe_output(op.get('content', 'Binary/directory payload: hash only')[:8192], op['path']),
                              'previewTruncated': len(op.get('content', '')) > 8192})
         if len(canonical(items)) > MAX_TREE * 3:
             raise ValueError('Plan exceeds backup limit')

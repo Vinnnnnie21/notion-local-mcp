@@ -8,6 +8,7 @@ import codecs
 import hashlib
 import json
 import os
+import secrets
 import pty
 import re
 import selectors
@@ -22,21 +23,29 @@ import uuid
 from pathlib import Path
 
 from file_access import safe_output, open_components, SECRET
+from dev_diagnostics import diagnostic_for
+from dev_workspace import read_regular, DEPENDENCY_DIRS
+from preservation_jobs import PreservationJobs
 
-NODE = Path(os.environ.get('NOTION_MCP_NODE_RUNTIME', '/opt/node'))
-NODE_NPM = Path(os.environ.get('NOTION_MCP_NODE_NPM', '/opt/node-v20'))
-PYTHON = Path(os.environ.get('NOTION_MCP_PYTHON_RUNTIME', '/opt/python'))
-CACHE = Path(os.environ.get('NOTION_MCP_PYTHON_CACHE', '/opt/dependency-cache/python'))
+TREE_HASH_SKIP = DEPENDENCY_DIRS | {'.dev-artifacts', 'dist', '.cache'}
+
+NODE = Path(os.environ.get('NOTION_MCP_NODE_RUNTIME', '/opt/notion-local-mcp/node'))
+NODE_NPM = Path(os.environ.get('NOTION_MCP_NODE_NPM', '/opt/notion-local-mcp/node-v20'))
+NODE_MODERN = Path(os.environ.get('NOTION_MCP_NODE_MODERN', '/opt/notion-local-mcp/node-v22'))
+NPM_CACHE = Path(os.environ.get('NOTION_MCP_NPM_CACHE', '/opt/notion-local-mcp/dependency-cache/npm'))
+PYTHON = Path(os.environ.get('NOTION_MCP_PYTHON_RUNTIME', '/opt/notion-local-mcp/python'))
+CACHE = Path(os.environ.get('NOTION_MCP_PYTHON_CACHE', '/opt/notion-local-mcp/dependency-cache/python'))
 ID = re.compile(r'^[A-Za-z0-9_-]{1,100}$')
 ENV_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 SECRET_ENV = re.compile(r'(?i)(token|secret|password|passwd|credential|private.?key|api.?key|auth|ssh|aws|cloud|database|dsn|socket|proxy)')
-DEFAULT_ENV = {'PATH': '/opt/node-v20/bin:/opt/node/bin:/opt/python/bin:/usr/bin:/bin', 'HOME': '/home/dev',
+DEFAULT_ENV = {'PATH': '/opt/node-toolchain/bin:/opt/node-v20/bin:/opt/node/bin:/opt/python/bin:/usr/bin:/bin', 'HOME': '/home/dev',
                'TMPDIR': '/tmp', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PYTHONNOUSERSITE': '1',
                'NODE_PATH': '/opt/node/node_modules', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
                'LD_LIBRARY_PATH': '/opt/postgresql/lib/x86_64-linux-gnu'}
 PUBLIC_FIELDS = ('taskId', 'requestId', 'workspaceId', 'profile', 'status', 'exitCode', 'unknown',
                  'stdout', 'stderr', 'truncated', 'startedAt', 'finishedAt', 'artifactsPath', 'pty')
 LIVE = {'queued', 'running', 'terminating', 'finalizing'}
+RECOVERY_ID = re.compile(r'^[0-9a-f]{32}$')
 
 
 def _credential_marker(text):
@@ -105,6 +114,28 @@ def _environment(env):
     return result
 
 
+def approve_recovery(config_path, recovery_id, confirmation):
+    """本机 CLI 使用的独立批准；MCP 工具不调用此函数。"""
+    if confirmation != 'APPROVE RECOVERY' or not RECOVERY_ID.fullmatch(recovery_id):
+        raise ValueError('Local recovery approval was cancelled or invalid')
+    config = json.loads(Path(config_path).read_text())
+    state = Path(config['stateDir']).resolve()
+    path = state / 'development-recovery' / (recovery_id + '.json')
+    record = json.loads(path.read_text())
+    if record.get('status') != 'pending' or record.get('approved') or record.get('expires', 0) < time.time():
+        raise ValueError('Recovery is already approved, expired, or not pending')
+    fields = {key: record.get(key) for key in
+              ('recoveryId', 'workspaceId', 'profile', 'scope', 'blockers', 'treeHash', 'configHash', 'expires')}
+    binding = hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    if binding != record.get('binding'):
+        raise ValueError('Recovery binding mismatch')
+    record['approved'] = True; record['status'] = 'approved'; record['approvedBinding'] = binding; record['approvedAt'] = time.time()
+    temporary = path.with_name('.' + path.name + '.pending')
+    temporary.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True))
+    os.replace(temporary, path)
+    return {'recoveryId': recovery_id, 'approved': True, 'expiresAt': record['expires']}
+
+
 def _command(argv, shell):
     if (argv is None) == (shell is None): raise ExecutionError('Choose argv or explicit shell, not both')
     if shell is not None:
@@ -120,10 +151,17 @@ def _command(argv, shell):
 
 def _tree_hash(root):
     """不包含输出制品，避免仅产生日志被当作代码修复。"""
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ExecutionError('Workspace fingerprint requires an existing regular directory')
     digest = hashlib.sha256()
     for directory, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d != '.dev-artifacts')
+        dirs[:] = sorted(d for d in dirs if d not in TREE_HASH_SKIP)
+        if any((Path(directory) / name).is_symlink() for name in dirs):
+            raise ExecutionError('Workspace fingerprint refuses symbolic link directories')
         for name in sorted(files):
+            if name.endswith('.tsbuildinfo'):
+                continue
             path = Path(directory) / name
             info = path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -132,6 +170,25 @@ def _tree_hash(root):
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(descriptor, 'rb') as stream:
                 for chunk in iter(lambda: stream.read(65536), b''): digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _complete_tree_hash(root):
+    """保全哈希包含制品和隐藏文件；链接及特殊节点不能进入保全。"""
+    digest = hashlib.sha256()
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        dirs.sort()
+        for name in sorted(dirs + files):
+            path = Path(directory) / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise ExecutionError('Workspace preservation encountered an unsafe node')
+            relative = path.relative_to(root).as_posix().encode()
+            digest.update(relative + b'\0' + str(stat.S_IMODE(info.st_mode)).encode() + b'\0')
+            if stat.S_ISREG(info.st_mode):
+                with path.open('rb') as stream:
+                    for chunk in iter(lambda: stream.read(65536), b''):
+                        digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -161,7 +218,120 @@ class Execution:
             self._stop_slice(record.get('slice'))
             path.unlink()
         self.registry = registry
+        self.recovery_root = backend.state / 'development-recovery'
+        self.recovery_root.mkdir(mode=0o700, exist_ok=True)
+        self._preservation_jobs = PreservationJobs(self.recovery_root / 'preservation-jobs')
         atexit.register(self.shutdown)
+
+    def _budget_key(self, meta):
+        return meta['profile'] + ':' + str(meta.get('source') or meta.get('project') or meta['path'])
+
+    def _related_jobs(self, meta):
+        key = self._budget_key(meta)
+        return [job for job in self.jobs.values() if job.get('budgetKey') == key or
+                (not job.get('budgetKey') and job.get('workspaceId') == meta['id'])]
+
+    def _safety_blockers(self, meta):
+        blockers = []
+        for job in self._related_jobs(meta):
+            if job.get('status') not in {'blocked', 'unknown', 'termination_failed'}:
+                continue
+            blockers.append({key: job.get(key) for key in
+                ('taskId', 'requestId', 'workspaceId', 'status', 'failureClass',
+                 'unknown', 'finishedAt', 'terminationReason')})
+        return sorted(blockers, key=lambda item: (item.get('taskId') or ''))
+
+    def _tree_fingerprint(self, meta):
+        try:
+            return _tree_hash(Path(meta.get('livePath') or meta['path']))
+        except (OSError, ValueError, ExecutionError) as error:
+            raise ExecutionError('Workspace tree cannot be safely fingerprinted') from error
+
+    def _config_fingerprint(self):
+        config_path = getattr(self.backend, 'config_path', None)
+        if config_path is not None:
+            raw = Path(config_path).read_bytes()
+        else:
+            raw = json.dumps(self.backend.dev_policy('autonomous-development'), sort_keys=True).encode()
+        return hashlib.sha256(raw).hexdigest()
+
+    def _recovery_binding(self, record):
+        fields = {key: record.get(key) for key in
+                  ('recoveryId', 'workspaceId', 'profile', 'scope', 'blockers', 'treeHash', 'configHash', 'expires')}
+        return hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+    def _recovery_record(self, recoveryId):
+        if not RECOVERY_ID.fullmatch(recoveryId):
+            raise ExecutionError('Invalid recovery identifier')
+        path = self.recovery_root / (recoveryId + '.json')
+        if not path.is_file():
+            raise ExecutionError('Unknown recovery request')
+        return path, json.loads(path.read_text())
+
+    def _recovery_status(self, meta, blockers):
+        """诊断与执行共用同一边界；失效原因不包含代码、凭据或审批内容。"""
+        if not blockers:
+            return {'status': 'not_required', 'reason': None}
+        records = []
+        for path in self.recovery_root.glob('*.json'):
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if (record.get('workspaceId') == meta['id'] and
+                    record.get('profile') == meta['profile'] and record.get('status') == 'applied'):
+                records.append(record)
+        if not records:
+            return {'status': 'required', 'reason': 'no_applied_recovery'}
+        current_tree = self._tree_fingerprint(meta)
+        current_config = self._config_fingerprint()
+        reasons = []
+        for record in sorted(records, key=lambda item: item.get('appliedAt', 0), reverse=True):
+            reason = ('expired' if record.get('expires', 0) < time.time() else
+                      'tree_changed' if record.get('treeHash') != current_tree else
+                      'configuration_changed' if record.get('configHash') != current_config else
+                      'safety_events_changed' if record.get('blockers') != blockers else None)
+            if reason is None:
+                return {'status': 'active', 'reason': None, 'record': record}
+            reasons.append(reason)
+        return {'status': 'required', 'reason': reasons[0]}
+
+    def _active_recovery(self, meta, blockers):
+        return self._recovery_status(meta, blockers).get('record')
+
+    def preservation_valid(self, meta):
+        manager = getattr(self, '_preservation_jobs', None)
+        if manager is not None and manager.busy(meta['id']): return False
+        preservation_id = meta.get('preservationId')
+        if not isinstance(preservation_id, str) or not RECOVERY_ID.fullmatch(preservation_id):
+            return False
+        manifest = self.recovery_root / 'preservations' / preservation_id / 'manifest.json'
+        if not manifest.is_file():
+            return False
+        try:
+            record = json.loads(manifest.read_text())
+            source_matches = (record.get('workspaceId') == meta['id'] and
+                record.get('treeHash') == _complete_tree_hash(Path(meta.get('livePath') or meta['path'])) and
+                meta.get('preservedTreeHash') == record.get('treeHash'))
+            if record.get('formatVersion') == 2:
+                return (source_matches and record.get('treeRoot') == 'files' and
+                    _complete_tree_hash(manifest.parent / 'files') == record.get('treeHash'))
+            return source_matches
+        except (OSError, ValueError, ExecutionError):
+            return False
+
+    def _recovery_gate(self, meta, related):
+        blockers = self._safety_blockers(meta)
+        recovery = self._recovery_status(meta, blockers)
+        if blockers and recovery['status'] != 'active':
+            detail = {'code': 'project_safety_blocked', 'classification': 'security',
+                      'scope': 'project-and-profile', 'workspaceId': meta['id'],
+                      'blockers': blockers, 'cleanupReleasesResourcesOnly': True,
+                      'recoveryRequired': True, 'recoveryReason': recovery['reason'],
+                      'approvalBinding': ['workspace', 'tree', 'configuration', 'safety_events', 'expiry']}
+            raise ExecutionError('Workspace stopped after a safety failure or unknown result; use registered cleanup',
+                                 'execution_security_error', 'security', detail)
+        return blockers
 
     def _audit(self, action, task_id, status):
         """只审计任务标识与状态，不记录命令、环境变量或交互输入。"""
@@ -214,6 +384,13 @@ class Execution:
                 _exec(['/usr/bin/systemctl', '--user', 'revert', name], timeout=5)
             except (OSError, subprocess.TimeoutExpired): pass
 
+    def _node_toolchain(self):
+        # 只使用本机管理员预置的固定目录；工具参数不能修改；不继承工具传入的环境变量，也不联网下载。
+        selected = NODE_MODERN if NODE_MODERN.exists() or NODE_MODERN.is_symlink() else NODE_NPM
+        if selected.is_symlink() or not all((selected / ('bin/' + name)).is_file() for name in ('node', 'npm')):
+            raise ExecutionError('Fixed Node toolchain incomplete; local administrator provisioning required; no host fallback')
+        return selected
+
     def _anchor_argv(self, limits):
         args = ['/usr/bin/bwrap', '--unshare-all', '--new-session', '--clearenv', '--cap-drop', 'ALL',
                 '--uid', str(os.getuid()), '--gid', str(os.getgid()), '--ro-bind', '/usr', '/usr',
@@ -224,14 +401,19 @@ class Execution:
                 '--symlink', 'data/workspace', '/workspace', '--symlink', 'data/tmp', '/tmp', '--symlink', 'data/home', '/home',
                 '--ro-bind', str(NODE), '/opt/node', '--ro-bind', str(PYTHON), '/opt/python',
                 '--ro-bind', str(NODE_NPM), '/opt/node-v20',
+                '--ro-bind', str(self._node_toolchain()), '/opt/node-toolchain',
                 '--ro-bind', str(CACHE), '/opt/dependency-cache/python',
                 '--dir', '/etc', '--ro-bind', '/etc/ssl/certs', '/etc/ssl/certs']
+        if NPM_CACHE.exists():
+            if NPM_CACHE.is_symlink() or not NPM_CACHE.is_dir():
+                raise ExecutionError('Fixed offline npm cache must be a local directory')
+            args += ['--ro-bind', str(NPM_CACHE), '/opt/dependency-cache/npm']
         for filename in ('hosts', 'nsswitch.conf', 'passwd', 'group', 'localtime'):
             path = Path('/etc') / filename
             if path.exists(): args += ['--ro-bind', str(path), str(path)]
         chrome = Path('/opt/google/chrome')
         if chrome.is_dir(): args += ['--ro-bind', str(chrome), str(chrome)]
-        postgres = Path(os.environ.get('NOTION_MCP_POSTGRES_RUNTIME', '/opt/postgresql'))
+        postgres = Path(os.environ.get('NOTION_MCP_POSTGRES_RUNTIME', '/opt/notion-local-mcp/postgresql'))
         if postgres.is_dir(): args += ['--ro-bind', str(postgres), '/opt/postgresql']
         for key, value in DEFAULT_ENV.items(): args += ['--setenv', key, value]
         # 在沙箱内保持一个无业务逻辑的进程；命令通过 nsenter 单独进入。
@@ -239,6 +421,9 @@ class Execution:
         return args
 
     def _ensure_sandbox(self, meta, policy):
+        manager = getattr(self, '_preservation_jobs', None)
+        if manager is not None and manager.busy(meta['id']):
+            raise ExecutionError('Preservation pending; query the original request before execution')
         limits = _limits(policy)
         existing = self.sandboxes.get(meta['id'])
         if existing:
@@ -250,6 +435,7 @@ class Execution:
             return existing
         if not all(path.exists() for path in (NODE / 'bin/node', PYTHON / 'bin/python3', Path('/usr/bin/bwrap'), Path('/usr/bin/nsenter'), CACHE, NODE_NPM / 'bin/npm')):
             raise ExecutionError('Required isolated runtime unavailable; no host fallback')
+        self._node_toolchain()
         self.backend.dev_validate_tree(meta['id'], meta['profile'])
         unit = 'linux-mcp-dev-' + uuid.uuid4().hex[:24] + '.service'
         slice_name = 'linux-mcp-workspace-' + uuid.uuid4().hex[:24] + '.slice'
@@ -291,6 +477,8 @@ class Execution:
                 if path.is_dir(): shutil.copytree(path, target, symlinks=False)
                 else: shutil.copy2(path, target)
             meta['livePath'] = str(live)
+            meta['executionState'] = 'active'
+            if hasattr(self.backend, 'dev_save_meta'): self.backend.dev_save_meta(meta)
             record.update(pid=pid, startedAt=time.time(), limits=limits)
             self.sandboxes[meta['id']] = record
             self.backend.atomic_json(self.registry / (meta['id'] + '.json'), record)
@@ -322,6 +510,8 @@ class Execution:
             captureLimit=job.get('captureLimit'),persistLimit=job.get('persistLimit'),inlineLimit=inline,
             drainLimit=job.get('drainLimit'),timeoutEvidence=job.get('timeoutEvidence'),persistenceTruncated=job.get('persistenceTruncated',False))
         if 'resourceCounters' in job: record['resourceCounters'] = job['resourceCounters']
+        if 'resourceCountersAvailable' in job: record['resourceCountersAvailable'] = job['resourceCountersAvailable']
+        if 'diagnostic' in job: record['diagnostic'] = job['diagnostic']
         return record
 
     def _budget_public(self,job):
@@ -403,8 +593,8 @@ class Execution:
                 self._budget_error('repair_budget_exhausted',used,maximum)
             if used>=maximum and not (cleanup or readonly_diagnostic):
                 self._budget_error('repair_budget_exhausted',used,maximum)
-            if any(j['status'] in {'blocked','unknown','termination_failed'} for j in related) and not (cleanup or readonly_diagnostic):
-                raise ExecutionError('Workspace stopped after a safety failure or unknown result; use registered cleanup')
+            if not (cleanup or readonly_diagnostic):
+                self._recovery_gate(meta, related)
             self.backend.dev_validate_tree(workspaceId, profile, allowExpired=cleanup)
             tree_hash = _tree_hash(Path(meta.get('livePath') or meta['path']))
             command_hash=hashlib.sha256(json.dumps([argv,shell,working_directory,env],sort_keys=True).encode()).hexdigest()
@@ -554,14 +744,17 @@ class Execution:
                 if job['terminationReason']:job['status']=job['terminationReason']
                 elif job['cancelRequested']:job['status']='cancelled'
                 else:job['status']='succeeded' if proc.returncode==0 else 'failed'
+            self._capture_failure_resources(job)
             if job['status']=='failed' and not job['stderr']:
-                job['resourceCounters']=self._resource_counters(job['slice'])
                 job['stderr']='Isolated command failed without diagnostic output; inspect resourceCounters.'
             # 结果状态与输出完整性独立；安全检查失败禁止导出，但不重放命令。
             final_status=job['status'];job['status']='finalizing'
             try:self.backend.dev_validate_tree(meta['id'],meta['profile'],allowExpired=True)
-            except (OSError,ValueError):
-                final_status='blocked';job.update(stdout='',stderr='Workspace validation failed; output withheld')
+            except (OSError,ValueError) as error:
+                diagnostic=diagnostic_for(error,meta['id'],'dev_run','postflight')
+                final_status='blocked';job.update(stdout='',stderr='Workspace validation failed; output withheld',
+                    diagnostic=diagnostic,outputComplete=False)
+                self.backend.audit.info(json.dumps({'event':'development_denied',**diagnostic}))
             if job.get('interrupted'):final_status='unknown';job['unknown']=True
         except Exception:
             job.update(status='unknown' if proc else 'failed',unknown=bool(proc),
@@ -622,6 +815,18 @@ class Execution:
                     try: os.unlink(temporary, dir_fd=descriptor)
                     except FileNotFoundError: pass
         finally: os.close(descriptor)
+
+    def _capture_failure_resources(self, job):
+        """Collect failure evidence without replacing command output or terminal state."""
+        if job.get('status') == 'succeeded' and job.get('exitCode') == 0:
+            return
+        try:
+            job['resourceCounters'] = self._resource_counters(job.get('slice', ''))
+            job['resourceCountersAvailable'] = bool(job['resourceCounters'])
+        except Exception:
+            # Diagnostics must never convert a known command failure into unknown.
+            job['resourceCounters'] = {}
+            job['resourceCountersAvailable'] = False
 
     def _resource_counters(self, name):
         if not re.fullmatch(r'linux-mcp-workspace-[a-f0-9]{24}\.slice', name): return {}
@@ -693,6 +898,184 @@ class Execution:
         return self._run(profile, workspaceId, argv, shell, working_directory, env, timeout, requestId,
                          background, False, purpose, None, True)
 
+    def dev_execution_diagnose(self, workspaceId, profile='autonomous-development'):
+        """返回项目级安全阻断的安全摘要，不改变任务、审批或工作区。"""
+        self._policy(profile)
+        meta = self.backend.dev_workspace(workspaceId, profile, allowExpired=True, allowClosed=True)
+        related = self._related_jobs(meta)
+        blockers = self._safety_blockers(meta)
+        try:
+            recovery = self._recovery_status(meta, blockers)
+        except (OSError, ValueError):
+            recovery = {'status': 'required', 'reason': 'workspace_tree_unavailable'}
+        effective_blocked = bool(blockers) and recovery['status'] != 'active'
+        related_tasks = [{key: job.get(key) for key in
+                          ('taskId', 'requestId', 'workspaceId', 'status', 'failureClass', 'unknown')}
+                         for job in sorted(related, key=lambda item: item.get('taskId') or '')]
+        return {'workspaceId': workspaceId, 'profile': profile,
+                'scope': 'project-and-profile', 'blocked': effective_blocked, 'historicalBlockersPresent': bool(blockers),
+                'recoveryStatus': recovery['status'], 'recoveryReason': recovery['reason'],
+                'blockers': blockers, 'relatedTasks': related_tasks,
+                'relatedWorkspaces': sorted({job.get('workspaceId') for job in related if job.get('workspaceId')}),
+                'cleanupReleasesResourcesOnly': True,
+                'cleanupDoesNotClearBlock': True,
+                'recoveryRequired': effective_blocked,
+                'executionState': meta.get('executionState', 'not_started'),
+                'resourcesRegistered': workspaceId in self.sandboxes or
+                    (self.registry / (workspaceId + '.json')).exists(),
+                'changedPaths': len(meta.get('changed', []))}
+
+    def dev_execution_preserve(self, workspaceId, profile='autonomous-development', requestId=None):
+        self._policy(profile)
+        meta = self.backend.dev_workspace(workspaceId, profile, allowExpired=True, allowClosed=True)
+        if not isinstance(requestId, str) or not ID.fullmatch(requestId):
+            raise ExecutionError('Preservation requires a stable requestId')
+        with self.lock:
+            if not hasattr(self, '_preservation_jobs'):
+                self._preservation_jobs = PreservationJobs(self.recovery_root / 'preservation-jobs')
+        return self._preservation_jobs.submit(workspaceId, profile, requestId,
+            lambda preservation_id, progress: self._preserve_sync(
+                workspaceId, profile, requestId, preservation_id, progress),
+            allow_new=not meta.get('closed', False))
+
+    def _preserve_sync(self, workspaceId, profile='autonomous-development', requestId=None,
+                       preservation_id=None, progress=None):
+        """Internal complete-copy worker; never executes project code or changes approval."""
+        self._policy(profile)
+        meta = self.backend.dev_workspace(workspaceId, profile, allowExpired=True)
+        if workspaceId in self.sandboxes or (self.registry / (workspaceId + '.json')).exists():
+            raise ExecutionError('Stop execution resources before preserving the workspace')
+        if not isinstance(requestId, str) or not ID.fullmatch(requestId):
+            raise ExecutionError('Preservation requires a stable requestId')
+        source = Path(meta.get('livePath') or meta['path'])
+        if not source.is_dir():
+            raise ExecutionError('Workspace tree is unavailable for preservation')
+        if progress: progress('hashing')
+        source_before = _complete_tree_hash(source)
+        preservation_id = preservation_id or uuid.uuid4().hex
+        root = self.recovery_root / 'preservations' / preservation_id
+        temporary = root.with_name('.' + preservation_id + '.pending')
+        temporary.mkdir(mode=0o700, parents=True)
+        data_root = temporary / 'files'
+        data_root.mkdir(mode=0o700)
+        manifest = {}
+        copied_files = copied_dirs = copied_bytes = 0
+        try:
+            for directory, dirs, names in os.walk(source, followlinks=False):
+                relative_dir = Path(directory).relative_to(source)
+                target_dir = data_root / relative_dir
+                target_dir.mkdir(mode=0o700, exist_ok=True)
+                for name in sorted(dirs):
+                    source_dir = Path(directory) / name
+                    info = source_dir.lstat()
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                        raise ExecutionError('Workspace preservation encountered an unsafe directory')
+                    target = target_dir / name
+                    target.mkdir(mode=0o700, exist_ok=False)
+                    manifest[(relative_dir / name).as_posix()] = {'type': 'directory', 'mode': stat.S_IMODE(info.st_mode)}
+                    copied_dirs += 1
+                for name in sorted(names):
+                    source_file = Path(directory) / name
+                    info = source_file.lstat()
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise ExecutionError('Workspace preservation encountered an unsafe file')
+                    with source_file.open('rb') as stream:
+                        raw = stream.read()
+                    target = target_dir / name
+                    with target.open('xb') as stream:
+                        stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                    os.chmod(target, stat.S_IMODE(info.st_mode))
+                    manifest[(relative_dir / name).as_posix()] = {'type': 'file', 'mode': stat.S_IMODE(info.st_mode),
+                                                                   'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+                    copied_files += 1; copied_bytes += len(raw)
+                    if progress: progress('copying', copied_files, copied_dirs, copied_bytes)
+            for relative, entry in sorted(manifest.items(), key=lambda item: item[0].count('/'), reverse=True):
+                if entry['type'] == 'directory':
+                    os.chmod(data_root / relative, entry['mode'])
+                    child_fd = os.open(data_root / relative, os.O_RDONLY | os.O_DIRECTORY)
+                    try: os.fsync(child_fd)
+                    finally: os.close(child_fd)
+            data_fd = os.open(data_root, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(data_fd)
+            finally: os.close(data_fd)
+            if progress: progress('verifying', copied_files, copied_dirs, copied_bytes)
+            tree_hash = _complete_tree_hash(source)
+            if _complete_tree_hash(data_root) != source_before:
+                raise ExecutionError('Preservation copy verification failed; original tree retained')
+            if tree_hash != source_before:
+                raise ExecutionError('Workspace changed during preservation; original tree retained')
+            self.backend.atomic_json(temporary / 'manifest.json', {'preservationId': preservation_id,
+                'workspaceId': workspaceId, 'requestId': requestId, 'treeHash': tree_hash,
+                'entries': manifest, 'formatVersion': 2, 'treeRoot': 'files'})
+            directory_fd = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(directory_fd)
+            finally: os.close(directory_fd)
+            temporary.rename(root)
+            parent_fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(parent_fd)
+            finally: os.close(parent_fd)
+            meta['preservationId'] = preservation_id
+            meta['preservedTreeHash'] = tree_hash
+            meta['preservedAt'] = time.time()
+            self.backend.dev_save_meta(meta)
+            return {'workspaceId': workspaceId, 'preservationId': preservation_id,
+                    'treeHash': tree_hash, 'files': sum(x['type'] == 'file' for x in manifest.values()),
+                    'directories': sum(x['type'] == 'directory' for x in manifest.values()),
+                    'preserved': True}
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+
+    def dev_execution_request_recovery(self, workspaceId, profile='autonomous-development', ttlSeconds=1800):
+        self._policy(profile)
+        meta = self.backend.dev_workspace(workspaceId, profile, allowExpired=True)
+        blockers = self._safety_blockers(meta)
+        if not blockers:
+            raise ExecutionError('Workspace has no project safety block requiring recovery')
+        if type(ttlSeconds) is not int or not 60 <= ttlSeconds <= 86400:
+            raise ExecutionError('Recovery validity must be between 60 and 86400 seconds')
+        if workspaceId in self.sandboxes or (self.registry / (workspaceId + '.json')).exists():
+            raise ExecutionError('Stop execution resources before requesting recovery')
+        self.backend.dev_validate_tree(workspaceId, profile, allowExpired=True,
+                                       operation='dev_execution_request_recovery', phase='recovery')
+        record = {'recoveryId': secrets.token_hex(16), 'workspaceId': workspaceId, 'profile': profile,
+                  'scope': 'project-and-profile', 'blockers': blockers,
+                  'treeHash': self._tree_fingerprint(meta), 'configHash': self._config_fingerprint(),
+                  'created': time.time(), 'expires': time.time() + ttlSeconds,
+                  'status': 'pending', 'approved': False, 'used': False}
+        record['binding'] = self._recovery_binding(record)
+        self.backend.atomic_json(self.recovery_root / (record['recoveryId'] + '.json'), record)
+        return {'recoveryId': record['recoveryId'], 'status': record['status'], 'scope': record['scope'],
+                'workspaceId': workspaceId, 'blockers': blockers, 'treeHash': record['treeHash'],
+                'configHash': record['configHash'], 'blockerCount': len(blockers), 'expiresAt': record['expires'],
+                'approvalRequired': True, 'cleanupDoesNotClearBlock': True}
+
+    def dev_execution_apply_recovery(self, workspaceId, profile='autonomous-development', recoveryId=None):
+        self._policy(profile)
+        if not isinstance(recoveryId, str):
+            raise ExecutionError('Recovery identifier is required')
+        path, record = self._recovery_record(recoveryId)
+        meta = self.backend.dev_workspace(workspaceId, profile, allowExpired=True)
+        if record.get('status') != 'approved' or record.get('approved') is not True or record.get('used'):
+            raise ExecutionError('Recovery requires an unused local approval')
+        if record.get('workspaceId') != workspaceId or record.get('profile') != profile:
+            raise ExecutionError('Recovery target mismatch')
+        if record.get('expires', 0) < time.time():
+            raise ExecutionError('Recovery approval expired')
+        if workspaceId in self.sandboxes or (self.registry / (workspaceId + '.json')).exists():
+            raise ExecutionError('Recovery requires stopped execution resources')
+        blockers = self._safety_blockers(meta)
+        if blockers != record.get('blockers') or self._tree_fingerprint(meta) != record.get('treeHash') or self._config_fingerprint() != record.get('configHash'):
+            raise ExecutionError('Recovery binding no longer matches the workspace or safety event')
+        self.backend.dev_validate_tree(workspaceId, profile, allowExpired=True, operation='dev_execution_apply_recovery', phase='recovery')
+        if record.get('approvedBinding') != record.get('binding'):
+            raise ExecutionError('Recovery approval binding is invalid')
+        record['status'] = 'applied'; record['used'] = True; record['appliedAt'] = time.time()
+        self.backend.atomic_json(path, record)
+        return {'recoveryId': recoveryId, 'workspaceId': workspaceId, 'status': 'applied',
+                'scope': record['scope'], 'blockersPreserved': True, 'requestsPreserved': True,
+                'message': 'Recovery remains valid only for this workspace, unchanged tree, configuration and safety events until expiry; any change requires a new local approval'}
+
     def close_workspace(self, workspaceId, profile='autonomous-development', preserve=True):
         self._policy(profile)
         meta = self.backend.dev_workspace(workspaceId, profile, allowExpired=True)
@@ -706,10 +1089,35 @@ class Execution:
                 if thread is not None and thread.is_alive():
                     raise ExecutionError('Task cleanup has not completed; workspace preservation refused')
         sandbox = self.sandboxes.get(workspaceId)
-        if not sandbox: return {'workspaceId': workspaceId, 'closed': True, 'preserved': False}
+        if not sandbox:
+            meta.pop('livePath', None)
+            meta['executionState'] = 'resources_released'
+            if hasattr(self.backend, 'dev_save_meta'): self.backend.dev_save_meta(meta)
+            return {'workspaceId': workspaceId, 'closed': True, 'workspaceClosed': bool(meta.get('closed')),
+                    'preserved': False, 'resourcesReleased': True}
+        # 登记与副本身份必须吻合，不能清理调用者指定的任意单元或宿主路径。
+        if sandbox.get('workspaceId') != workspaceId:
+            raise ExecutionError('Cleanup workspace ownership mismatch')
+        live = Path('/proc/' + str(sandbox['pid']) + '/root/data/workspace')
+        if Path(meta.get('livePath', '')) != live:
+            raise ExecutionError('Cleanup sandbox path ownership mismatch')
+        diagnostic = None
+        evidence = None
+        result = None
         try:
             if preserve:
-                self.backend.dev_validate_tree(workspaceId, profile, allowExpired=True)
+                try:
+                    self.backend.dev_validate_tree(workspaceId, profile, allowExpired=True)
+                except (OSError, ValueError) as error:
+                    diagnostic = diagnostic_for(error, workspaceId, 'dev_execution_cleanup', 'cleanup')
+                    # 异常树只进入私有诊断区，不提升为合法工作树，也不返回内容。
+                    evidence = self._retain_cleanup_evidence(meta, live, diagnostic)
+                    meta['cleanupDiagnostic'] = diagnostic
+                    meta['cleanupEvidenceId'] = diagnostic['diagnostic_id']
+                    self.backend.dev_save_meta(meta)
+                    result = {'workspaceId': workspaceId, 'closed': True, 'preserved': False,
+                              'evidenceRetained': True, 'diagnostic': diagnostic}
+                    return result
                 live = Path(meta['livePath']); persisted = Path(meta['path'])
                 candidate = persisted.parent / ('persist-' + uuid.uuid4().hex)
                 shutil.copytree(live, candidate, symlinks=False)
@@ -717,12 +1125,66 @@ class Execution:
                 os.rename(persisted, backup)
                 os.rename(candidate, persisted)
                 shutil.rmtree(backup)
-            return {'workspaceId': workspaceId, 'closed': True, 'preserved': bool(preserve)}
+            result = {'workspaceId': workspaceId, 'closed': True, 'preserved': bool(preserve)}
+            return result
         finally:
-            self._stop_unit(sandbox['unit']); self.sandboxes.pop(workspaceId, None)
-            self._stop_slice(sandbox['slice'])
-            meta.pop('livePath', None)
-            (self.registry / (workspaceId + '.json')).unlink(missing_ok=True)
+            # 证据保存失败时保留登记和锚进程，供本机恢复；任务已经停止。
+            if diagnostic is None or evidence is not None:
+                released = self._stop_unit(sandbox['unit'])
+                if released:
+                    self._stop_slice(sandbox['slice'])
+                    self.sandboxes.pop(workspaceId, None)
+                    meta.pop('livePath', None)
+                    (self.registry / (workspaceId + '.json')).unlink(missing_ok=True)
+                    meta['executionState'] = 'resources_released'
+                    if hasattr(self.backend, 'dev_save_meta'): self.backend.dev_save_meta(meta)
+                if result is not None:
+                    result['resourcesReleased'] = bool(released)
+                    result['closed'] = bool(released)
+                    result['workspaceClosed'] = bool(meta.get('closed'))
+
+    def _retain_cleanup_evidence(self, meta, live, diagnostic):
+        """有界保存普通文件；链接和特殊节点只记录类型，不跟随或复制目标。"""
+        base = self.backend.dev_root / meta['id']
+        evidence = base / 'diagnostics' / diagnostic['diagnostic_id']
+        descriptor = open_components(base, '.', os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in ('diagnostics', diagnostic['diagnostic_id'], 'tree'):
+                try: os.mkdir(part, 0o700, dir_fd=descriptor)
+                except FileExistsError: pass
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+                os.close(descriptor); descriptor = child
+        finally:
+            os.close(descriptor)
+        policy = self.backend.dev_policy(meta['profile'])
+        limit = policy.get('limits', {}).get('diskBytes', 268435456)
+        count_limit = policy.get('limits', {}).get('files', 30000) + policy.get('limits', {}).get('generatedFiles', 50000)
+        total = 0; count = 0; omitted = 0
+        for directory, dirs, names in os.walk(live, followlinks=False):
+            for name in sorted(dirs + names):
+                source = Path(directory) / name
+                relative = source.relative_to(live)
+                info = source.lstat()
+                count += 1
+                if count > count_limit:
+                    raise ExecutionError('Cleanup evidence file budget exceeded; sandbox retained')
+                if stat.S_ISDIR(info.st_mode):
+                    fd = open_components(evidence / 'tree', str(relative.parent), os.O_RDONLY | os.O_DIRECTORY)
+                    try: os.mkdir(relative.name, 0o700, dir_fd=fd)
+                    finally: os.close(fd)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    raw, _ = read_regular(live, relative, max(0, limit - total))
+                    total += len(raw)
+                    fd = open_components(evidence / 'tree', str(relative.parent), os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        output = os.open(relative.name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+                        with os.fdopen(output, 'wb') as stream: stream.write(raw)
+                    finally: os.close(fd)
+                else:
+                    omitted += 1
+        self.backend.atomic_json(evidence / 'summary.json',
+            {'diagnostic': diagnostic, 'bytes': total, 'nodes': count, 'omittedUnsafeNodes': omitted})
+        return evidence
 
     def shutdown(self):
         for job in list(self.jobs.values()):
@@ -756,9 +1218,18 @@ def attach_execution(cls):
         return self.dev_executor.internal(profile, workspaceId, argv, shell, env, timeout, background, working_directory, requestId,purpose,control)
     def dev_execution_cleanup(self, workspaceId, profile='autonomous-development'):
         return self.dev_executor.close_workspace(workspaceId, profile)
+    def dev_execution_diagnose(self, workspaceId, profile='autonomous-development'):
+        return self.dev_executor.dev_execution_diagnose(workspaceId, profile)
+    def dev_execution_preserve(self, workspaceId, profile='autonomous-development', requestId=None):
+        return self.dev_executor.dev_execution_preserve(workspaceId, profile, requestId)
+    def dev_execution_request_recovery(self, workspaceId, profile='autonomous-development', ttlSeconds=1800):
+        return self.dev_executor.dev_execution_request_recovery(workspaceId, profile, ttlSeconds)
+    def dev_execution_apply_recovery(self, workspaceId, profile='autonomous-development', recoveryId=None):
+        return self.dev_executor.dev_execution_apply_recovery(workspaceId, profile, recoveryId)
     cls.__init__ = initialize
     for fn in (dev_run, dev_task_status, dev_output, dev_cancel, dev_pty_open, dev_pty_input, dev_pty_close,
-               dev_exec_internal, dev_execution_cleanup): setattr(cls, fn.__name__, fn)
+               dev_exec_internal, dev_execution_cleanup, dev_execution_diagnose, dev_execution_preserve,
+               dev_execution_request_recovery, dev_execution_apply_recovery): setattr(cls, fn.__name__, fn)
     return cls
 
 
@@ -770,7 +1241,11 @@ TOOL_DESCRIPTIONS = {
     'dev_pty_open': '在同一个隔离开发副本中创建有时限的 PTY。',
     'dev_pty_input': '向隔离 PTY 写入普通输入，凭据输入被拒绝，输入不会保存。',
     'dev_pty_close': '关闭隔离 PTY 并停止其子进程。',
-    'dev_execution_cleanup': '停止副本内全部任务，验证并保留副本文件，销毁隔离网络和临时资源。'}
+    'dev_execution_cleanup': '停止副本内全部任务，验证并保留副本文件，销毁隔离网络和临时资源。',
+    'dev_execution_diagnose': '只读报告项目级安全阻断、关联任务、副本和范围；cleanup 不解除阻断。',
+    'dev_execution_preserve': '异步保全完整开发副本；使用同一 workspaceId 和 requestId 重复调用查询状态，不重复复制。仅 status=succeeded 且 preserved=true 表示完成；unknown 不重放。失败保留原树。',
+    'dev_execution_request_recovery': '为指定安全事件生成绑定树哈希、配置哈希和有效期的本机恢复申请；不会批准。',
+    'dev_execution_apply_recovery': '应用已经由本机批准的精确恢复申请；新安全事件或文件变化会使批准失效。'}
 
 
 def _schema(properties, required):
@@ -794,4 +1269,8 @@ TOOL_SCHEMAS = {'dev_run': _schema({**BASE, 'background': {'type': 'boolean', 'd
     'dev_pty_open': _schema({**BASE, 'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600, 'default': 600}}, ['profile', 'workspaceId']),
     'dev_pty_input': _schema({'taskId': {'type': 'string'}, 'data': {'type': 'string', 'maxLength': 16384}}, ['taskId', 'data']),
     'dev_pty_close': _schema({'taskId': {'type': 'string'}}, ['taskId']),
-    'dev_execution_cleanup': _schema({'workspaceId': {'type': 'string'}, 'profile': {'type': 'string', 'default': 'autonomous-development'}}, ['workspaceId'])}
+    'dev_execution_cleanup': _schema({'workspaceId': {'type': 'string'}, 'profile': {'type': 'string', 'default': 'autonomous-development'}}, ['workspaceId']),
+    'dev_execution_diagnose': _schema({'workspaceId': {'type': 'string'}, 'profile': {'type': 'string', 'default': 'autonomous-development'}}, ['workspaceId']),
+    'dev_execution_preserve': _schema({'workspaceId': {'type': 'string'}, 'profile': {'type': 'string', 'default': 'autonomous-development'}, 'requestId': {'type': 'string', 'pattern': '^[A-Za-z0-9_-]{1,100}$'}}, ['workspaceId', 'requestId']),
+    'dev_execution_request_recovery': _schema({'workspaceId': {'type': 'string'}, 'profile': {'type': 'string', 'default': 'autonomous-development'}, 'ttlSeconds': {'type': 'integer', 'minimum': 60, 'maximum': 86400}}, ['workspaceId']),
+    'dev_execution_apply_recovery': _schema({'workspaceId': {'type': 'string'}, 'profile': {'type': 'string', 'default': 'autonomous-development'}, 'recoveryId': {'type': 'string', 'pattern': '^[0-9a-f]{32}$'}}, ['workspaceId', 'recoveryId'])}

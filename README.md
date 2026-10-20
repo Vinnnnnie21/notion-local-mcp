@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-这是已创建的公开仓库，包含运行源码、测试、配置模板、安装辅助脚本和用户级 systemd 模板。当前版本来自 `2.2.1-execution-reliability`。目前没有发布 Release。
+这是已创建的公开仓库，包含运行源码、测试、配置模板、安装辅助脚本和用户级 systemd 模板。当前版本为 `2.2.8-service-timeout-validation`。目前没有发布 Release。更新内容见 [CHANGELOG.md](CHANGELOG.md)，验证结果见 [docs/VALIDATION.md](docs/VALIDATION.md)。
 
 尚未宣称所有 Linux 都支持：隔离执行需要用户级 systemd、cgroup v2、bubblewrap、namespaces，以及按需准备的 Node、Python、PostgreSQL 和 Chromium 运行时。没有这些条件时，服务必须明确失败，不会退回宿主 Shell。维护者还没有在不含生产资源的全新主机上完成本文档全部的浏览器、数据库和远程 Notion 验收，因此发布前仍需完成检查清单。
 
@@ -34,7 +34,7 @@ Notion AI -> HTTPS 入口 -> 认证 MCP -> 授权项目 / 隔离开发副本
 
 ## 安装
 
-支持 Debian 13、Ubuntu 24.04 等具备用户级 systemd 和 cgroup v2 的 Linux 主机。先安装系统依赖：`python3`、`python3-venv`、`git`、`bubblewrap`、`util-linux` 的 `nsenter`，并在需要时安装 Node/npm、PostgreSQL 和 Chromium。用环境预检查看当前主机，不会修改系统：
+隔离功能需要具备用户级 systemd 和 cgroup v2 的 Linux 主机。本次可移植测试使用 Debian 13 和 Python 3.13，完整系统支持仍需按检查清单验收。先安装系统依赖：`python3`、`python3-venv`、`git`、`bubblewrap`、`util-linux` 的 `nsenter`，并在需要时安装 Node/npm、PostgreSQL 和 Chromium。用环境预检查看当前主机，不会修改系统：
 
 ```bash
 python3 scripts/check_environment.py
@@ -70,12 +70,16 @@ python app/manage.py --config "$HOME/.config/notion-local-mcp/config.json" valid
 ```bash
 export NOTION_MCP_NODE_RUNTIME=/opt/notion-local-mcp/node
 export NOTION_MCP_NODE_NPM=/opt/notion-local-mcp/node-v20
+export NOTION_MCP_NODE_MODERN=/opt/notion-local-mcp/node-v22
+export NOTION_MCP_NPM_CACHE=/opt/notion-local-mcp/dependency-cache/npm
 export NOTION_MCP_PYTHON_RUNTIME=/opt/notion-local-mcp/python
 export NOTION_MCP_PYTHON_CACHE=/opt/notion-local-mcp/dependency-cache/python
 export NOTION_MCP_POSTGRES_RUNTIME=/opt/notion-local-mcp/postgresql
 ```
 
-这些目录不是本项目的 MIT 内容，也不由安装脚本自动下载。
+这些路径也是当前默认值。Node 和 Python 目录分别需要 `bin/node` 和 `bin/python3`；Node/npm 工具链需要同时提供 `bin/node` 与 `bin/npm`，且工具链根目录不能是符号链接。执行器优先选择 `NOTION_MCP_NODE_MODERN` 指向的目录；该目录不存在时使用 `NOTION_MCP_NODE_NPM`。后者仍是必需的只读挂载。npm 缓存可选，存在时以只读方式挂载。
+
+这些目录不是本项目的 MIT 内容，也不由安装脚本自动下载。环境变量在启动服务前由本机管理员设置；MCP 工具不能更改运行时路径。使用 systemd 时，应在服务的本机配置中填写变量。自定义 MCP 服务名时，`serviceNames.mcp` 与启动环境中的 `NOTION_MCP_SERVICE_NAME` 必须一致。
 
 ## 启动和检查
 
@@ -119,9 +123,26 @@ cloudflared tunnel --url http://127.0.0.1:8001
 
 ## 第一个开发任务
 
-先调用 `list_projects`，不要猜项目编号。创建副本后按顺序调用 `dev_environment_ready`、`dev_read`/`dev_list`、`dev_run`、`dev_task_status`、`dev_output`，最后按需 `dev_sync`、`dev_execution_cleanup` 和 `dev_workspace_close`。写入和同步都使用上一次完整哈希；新增文件使用 `expectedHash=missing`。
+先调用 `list_projects`，不要猜项目编号。创建副本后按顺序调用 `dev_environment_ready`、`dev_read`/`dev_list`、`dev_run`、`dev_task_status`、`dev_output`，最后按需 `dev_sync` 和 `dev_execution_cleanup`。写入和同步都使用上一次完整哈希；新增文件使用 `expectedHash=missing`。副本创建结果的 `sourceCopyComplete` 与 `skippedReasonCounts` 会说明是否存在被排除的条目，不能默认副本包含整个项目。
+
+关闭有修改的副本前，先停止执行资源，再调用 `dev_execution_preserve`。使用相同的 `workspaceId` 和 `requestId` 查询进度，直到 `status=succeeded` 且 `preserved=true`，随后调用 `dev_workspace_close`。保存失败时原副本保留；`unknown` 表示不能自动重放。
 
 `requestId` 用于请求去重；同一个编号配不同参数会被拒绝。副作用结果未知时返回 `UNKNOWN`，不能自动重放，先查询原请求。`purpose=expected-test` 表示预期失败，`purpose=repair` 必须配稳定的 `repairId`，修复预算按项目和 profile 累计，创建新副本不会清零。超时可以设置 1 秒到 profile 上限，默认 60 秒。大输出用 `dev_output` 的字符游标分页，同时检查 `truncated`、`droppedBytes`、`outputComplete` 和排空限制。
+
+`dev_service_start` 的超时也受 profile 的 `maxTimeoutSeconds` 限制；无效超时会在登记服务和端口前被拒绝。`dev_environment_ready` 会报告选中的 Node/npm 版本、离线缓存和前端模块解析结果。该检查以副本根目录为基准，子目录应用仍需在自己的工作目录检查依赖。
+
+## 安全诊断与本机恢复
+
+安全事件或结果未知造成的项目阻断，可用 `dev_execution_diagnose` 查看。清理资源不会清除阻断。需要恢复时，先调用 `dev_execution_request_recovery`，由本机操作员审阅申请后运行：
+
+```bash
+python app/manage.py --config "$HOME/.config/notion-local-mcp/config.json" \
+  recovery-approve <recoveryId>
+```
+
+然后使用 `dev_execution_apply_recovery` 应用已批准的申请。批准绑定副本、文件树哈希、配置哈希、安全事件和有效期；任一项变化都需要重新申请。普通 MCP 调用不能批准自己的恢复请求。
+
+文件校验失败可返回规则编号、相对文件位置和诊断编号，便于定位；诊断不返回文件内容和宿主绝对路径。源码中的有限数值代次声明会保留可读性，字符串凭据和日志赋值仍受检查。凭据识别有局限，不能替代配置权限和人工审阅。
 
 ## 测试和发布前检查
 
@@ -129,9 +150,12 @@ cloudflared tunnel --url http://127.0.0.1:8001
 
 ```bash
 python3 scripts/test.py
+python3 scripts/smoke_test.py
 ```
 
-完整隔离测试另需 bubblewrap、用户 systemd、cgroup v2、只读运行时缓存和浏览器/数据库。当前 CI 只运行可移植单元测试；Linux 全功能作业故意关闭，避免把 GitHub hosted runner 的能力误当作保证。发布前必须在干净、无生产凭据的 Linux 主机完成 `docs/RELEASE_CHECKLIST.md`，并把跳过项和原因记录下来。
+`smoke_test.py` 创建临时演示配置和认证文件，在空闲 loopback 端口启动独立 MCP 服务，验证完成后关闭并删除临时数据。它不连接已有服务，也不使用生产资源。
+
+完整隔离测试使用 `python3 scripts/test.py --integration`，另需 bubblewrap、用户 systemd、cgroup v2、只读运行时缓存和浏览器/数据库。默认明确跳过 15 项运行时测试。当前 CI 运行可移植单元测试和临时 HTTP 验证；Linux 全功能作业仍关闭。发布前必须在干净、无生产凭据的 Linux 主机完成 `docs/RELEASE_CHECKLIST.md`，并把跳过项和原因记录下来。
 
 ## 常见故障
 

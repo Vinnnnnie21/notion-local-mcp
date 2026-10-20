@@ -2,7 +2,7 @@
 import ast, base64, csv, difflib, fnmatch, hashlib, io, json, logging
 import logging.handlers, os, re, secrets, shutil, stat, subprocess, tempfile, threading, time
 from pathlib import Path
-VERSION='2.2.1-execution-reliability'
+VERSION='2.2.8-service-timeout-validation'
 FILE_LIMIT=2*1024*1024
 OUTPUT_LIMIT=128*1024
 SCAN_LIMIT=32*1024*1024

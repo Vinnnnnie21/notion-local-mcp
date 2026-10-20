@@ -1,5 +1,4 @@
 # Install from the official Python package index or a vetted company mirror.
-# Transport SDK could not be downloaded in the build environment; validate locally.
 mcp>=1.12,<2
 uvicorn>=0.30,<1
 starlette>=0.40,<1

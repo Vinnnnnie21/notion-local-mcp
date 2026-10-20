@@ -21,7 +21,7 @@ class Tests(unittest.TestCase):
         return plan['approvalId']
     def plan(self,path='a.py',content='new\n'):
         return self.b.plan_files('code',[{'path':path,'expectedHash':self.b.get_file_hash('code',path)['sha256'],'content':content}])
-    def test_01_health(self): self.assertEqual(self.b.health()['version'],'2.2.1-execution-reliability')
+    def test_01_health(self): self.assertEqual(self.b.health()['version'],'2.2.8-service-timeout-validation')
     def test_02_projects(self): self.assertEqual(self.b.list_projects()['projects'][0]['project'],'code')
     def test_03_root_rejection(self):
         self.cfg['projects']['code']['root']=str(pathlib.Path.home()); self.config.write_text(json.dumps(self.cfg))

@@ -23,6 +23,9 @@ artifacts/
 *.sqlite3
 *.sqlite-*
 *.log
+*.bak
+*.bak.*
+*.pre-*
 # Local development directories and dependency caches
 .venv/
 venv/
